@@ -1,43 +1,31 @@
-// index.js - Webhook 测试版（先确认 TV → DO 是否打通）
-
-const express = require('express');
-const app = express();
-
-// 让 Express 能读 JSON
-app.use(express.json());
-
-// 全局中间件：任何请求都会打印一行
-app.use((req, res, next) => {
-  console.log('🌐 Incoming request:', req.method, req.url);
-  next();
-});
-
-// 根路径：方便你在浏览器里打开看看服务活着没
-app.get('/', (req, res) => {
-  res.send('Apex-bot is running ✅');
-});
-
-// TradingView Webhook 路由
-app.post('/tv-webhook', (req, res) => {
+app.post('/tv-webhook', async (req, res) => {
   console.log('🔥 Webhook hit on /tv-webhook');
 
-  // 打印 header（可选）
   console.log('🧾 Headers:', JSON.stringify(req.headers, null, 2));
-
-  // 打印 body（TradingView 发送的内容）
   console.log('📩 Body from TradingView:', JSON.stringify(req.body, null, 2));
 
-  // 回应 TradingView
-  res.status(200).send('OK');
-});
+  const alert = req.body;  // TradingView 发来的 JSON
 
-// 兜底 404（也打印）
-app.use((req, res) => {
-  console.log('❓ No route matched for:', req.method, req.url);
-  res.status(404).send('Not found');
-});
+  // 简单检查一下 payload 是否正常
+  if (!alert || !alert.bot_id || !alert.symbol || !alert.signal_type) {
+    console.log('⚠️ Invalid alert payload, ignoring');
+    return res.status(400).send('Invalid alert');
+  }
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Apex-bot listening on port ${PORT}`);
+  try {
+    if (alert.signal_type === 'entry') {
+      // TODO：这里放“开仓”代码
+      console.log('✅ [模拟] Entry order to Apex:', alert.symbol, alert.side, alert.position_size);
+    }
+
+    if (alert.signal_type === 'exit') {
+      // TODO：这里放“平仓”代码
+      console.log('✅ [模拟] Exit order to Apex:', alert.symbol);
+    }
+
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('❌ Error handling alert:', err);
+    res.status(500).send('Error');
+  }
 });
