@@ -1,194 +1,152 @@
 // index.js
-// 你的 ApeX 机器人主程序（部署在 DigitalOcean App Platform）
-
 const express = require('express');
 const bodyParser = require('body-parser');
 
 const PORT = process.env.PORT || 8080;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
-// 尝试加载 ApeX 官方 Node SDK（apexomni-connector-node）
-// 如果你的 package.json 还没装这个包，程序会退回到“只打印日志模式”，不会崩。
-let ApexClient, OMNI, OrderSide;
-try {
-  // 注意：这行依赖你在 package.json 里装了 apexomni-connector-node
-  ({ ApexClient, OMNI, OrderSide } = require('apexomni-connector-node'));
-  console.log('[ApeX] SDK loaded: apexomni-connector-node');
-} catch (err) {
-  console.log(
-    '[ApeX] apexomni-connector-node not installed, running in LOG-ONLY mode'
-  );
-  console.log('[ApeX] Error loading SDK:', err.message);
-}
+const APEX_API_KEY = process.env.APEX_API_KEY || '';
+const APEX_API_SECRET = process.env.APEX_API_SECRET || '';
+const APEX_API_PASSPHRASE = process.env.APEX_API_PASSPHRASE || '';
+const APEX_OMNI_PRIVATE_KEY = process.env.APEX_OMNI_PRIVATE_KEY || '';
 
 const app = express();
+
+// TradingView 会发 JSON
 app.use(bodyParser.json());
 
-// ---------- 工具函数 ----------
+let apexClient = null;
+let apexReady = false;
 
-// 把 TradingView 的 BTCUSDT / ZECUSDT 转成 ApeX 用的 BTC-USDT / ZEC-USDT
-function tvToApexSymbol(tvSymbol) {
-  if (!tvSymbol) return tvSymbol;
-  if (tvSymbol.includes('-')) return tvSymbol;
-  return tvSymbol.replace(/USDT$/i, '-USDT');
-}
+// -------------------------------------------------------
+// 1) 尝试加载 ApeX 官方 Node SDK
+// -------------------------------------------------------
+try {
+  console.log('[Apex] Trying to load apexomni-connector-node...');
+  const { ApexClient, OMNI_HTTP_MAIN } = require('apexomni-connector-node');
 
-// 单例初始化 ApeX 客户端（只初始化一次）
-async function getApexClient() {
-  if (!ApexClient) {
-    // 没装 SDK，直接走模拟模式
-    return null;
-  }
-
-  if (!global._apexClientPromise) {
-    const key = process.env.APEX_API_KEY;
-    const secret = process.env.APEX_API_SECRET;
-    const passphrase = process.env.APEX_API_PASSPHRASE;
-    const seed = process.env.APEX_OMNI_PRIVATE_KEY;
-
-    if (!key || !secret || !passphrase || !seed) {
-      console.error(
-        '[ApeX] Missing env vars (APEX_API_KEY / SECRET / PASSPHRASE / OMNI_PRIVATE_KEY).'
-      );
-      console.error('[ApeX] Will NOT send real orders, log-only.');
-      return null;
-    }
-
-    console.log('[ApeX] Initializing client...');
-
-    const client = new ApexClient.omni(OMNI);
-    const apiKeyCredentials = { key, secret, passphrase };
-
-    global._apexClientPromise = client
-      .init(apiKeyCredentials, seed)
-      .then(() => {
-        console.log('[ApeX] Client initialized successfully');
-        return client;
-      })
-      .catch((err) => {
-        console.error('[ApeX] Failed to init client:', err);
-        global._apexClientPromise = null;
-        return null;
-      });
-  }
-
-  return global._apexClientPromise;
-}
-
-// 处理一条 TradingView 信号（目前默认“只打印 or 模拟下单”）
-async function handleSignal(alert) {
-  const client = await getApexClient();
-
-  const symbol = tvToApexSymbol(alert.symbol);
-  const sideStr = (alert.side || '').toLowerCase();
-  const side =
-    sideStr === 'buy'
-      ? OrderSide && OrderSide.BUY
-      : OrderSide && OrderSide.SELL;
-
-  // position_size 是你在 TV 填的 USDT 数量，这里先原样当作 size 字符串
-  const size = String(alert.position_size || '0.01');
-  const signalType = alert.signal_type || 'entry';
-  const orderType =
-    (alert.order_type || 'market').toUpperCase() === 'LIMIT'
-      ? 'LIMIT'
-      : 'MARKET';
-
-  if (!client) {
-    // 还没真连上 ApeX —— 先当“干跑”
-    console.log('🧪 [SIM ONLY] Would send order to ApeX:', {
-      symbol,
-      side: sideStr,
-      size,
-      orderType,
-      signalType,
-      bot_id: alert.bot_id,
-    });
-    return;
-  }
-
-  console.log('⚙️ [ApeX] handleSignal() with real client:', {
-    symbol,
-    side: sideStr,
-    size,
-    orderType,
-    signalType,
-    bot_id: alert.bot_id,
+  // 这里用主网，如果你想先用 testnet，可以换成 OMNI_HTTP_TEST
+  apexClient = new ApexClient({
+    baseUrl: OMNI_HTTP_MAIN,
+    apiKey: {
+      key: APEX_API_KEY,
+      secret: APEX_API_SECRET,
+      passphrase: APEX_API_PASSPHRASE
+    },
+    omniPrivateKey: APEX_OMNI_PRIVATE_KEY
   });
 
-  // -----------------------------
-  // ⚠️⚠️ 下面是真正下单的模板（先注释住）⚠️⚠️
-  // 等你准备好以后，再一步一步把注释去掉，并用很小的 size 测试
-  // -----------------------------
-
-  /*
-  const BigNumber = require('bignumber.js');
-
-  // 如果是 LIMIT，你需要一个价格；如果是 MARKET，可以直接用市价，
-  // 这里先用 alert.price，如果没有就随便给个占位价（一定记得自己改！）
-  const price = alert.price ? String(alert.price) : '100000';
-
-  const baseCoinRealPrecision = client.symbols[symbol]?.baseCoinRealPrecision;
-  const takerFeeRate = client.account.contractAccount.takerFeeRate;
-  const makerFeeRate = client.account.contractAccount.makerFeeRate;
-
-  const limitFee = new BigNumber(price)
-    .multipliedBy(takerFeeRate || '0')
-    .multipliedBy(size)
-    .toFixed(6, BigNumber.ROUND_UP);
-
-  const apiOrder = {
-    pairId: client.symbols[symbol]?.l2PairId,
-    makerFeeRate,
-    takerFeeRate,
-    symbol,
-    side,             // OrderSide.BUY or OrderSide.SELL
-    type: orderType,  // 'MARKET' or 'LIMIT'
-    size,
-    price,
-    limitFee,
-    timeInForce: 'GOOD_TIL_CANCEL',
-  };
-
-  const result = await client.privateApi.createOrder(apiOrder);
-  console.log('[ApeX] Order result:', result);
-  */
-
-  // 现在先只确认函数走到了这里
-  console.log(
-    '✅ handleSignal() finished (current mode: NO REAL ORDER, log only)'
-  );
+  // 异步初始化
+  (async () => {
+    try {
+      console.log('[Apex] Initializing Apex Omni client...');
+      await apexClient.init(); // 具体是否需要参数，要以官方示例为准
+      apexReady = true;
+      console.log('[Apex] Apex Omni client READY (live mode).');
+    } catch (err) {
+      console.error('[Apex] Failed to init Apex client, fallback to LOG_ONLY:', err);
+      apexClient = null;
+      apexReady = false;
+    }
+  })();
+} catch (err) {
+  console.log('[Apex] apexomni-connector-node not installed, running in LOG_ONLY mode');
+  apexClient = null;
+  apexReady = false;
 }
 
-// ---------- HTTP 路由 ----------
-
-app.get('/', (_req, res) => {
-  res.send('ApeX bot is running ✅');
-});
-
-// TradingView Webhook 入口
+// -------------------------------------------------------
+// 2) TradingView Webhook 接口
+// -------------------------------------------------------
 app.post('/tv-webhook', async (req, res) => {
-  console.log('🚨 Webhook hit on /tv-webhook');
-  console.log('Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('Body from TradingView:', JSON.stringify(req.body, null, 2));
+  console.log('🚀 Webhook hit on /tv-webhook');
+
+  // 取 header 里的 secret（你在 TradingView 里 Message 顶部可以自定义一个字段）
+  const incomingSecret = req.headers['x-webhook-secret'] || req.query.secret || '';
+
+  if (WEBHOOK_SECRET && incomingSecret !== WEBHOOK_SECRET) {
+    console.warn('❌ Invalid WEBHOOK_SECRET, ignoring request');
+    return res.status(401).send('Unauthorized');
+  }
 
   const alert = req.body || {};
+  console.log('📦 Body from TradingView:', JSON.stringify(alert, null, 2));
 
-  // 简单检查一下字段，避免乱请求
-  if (!alert.bot_id || !alert.symbol || !alert.side || !alert.signal_type) {
-    console.log('⚠️  Invalid alert payload, ignoring.');
-    return res.status(200).json({ ok: true, ignored: true });
+  // 简单校验
+  if (!alert.bot_id || !alert.symbol || !alert.signal_type) {
+    console.warn('⚠️ Invalid alert payload, missing fields');
+    return res.status(400).send('Invalid alert payload');
   }
 
+  const botId = alert.bot_id;
+  const symbol = alert.symbol;         // 例如 "ZECUSDT"
+  const side = (alert.side || '').toUpperCase();     // "BUY" / "SELL"
+  const orderType = (alert.order_type || 'market').toUpperCase(); // "MARKET" / ...
+  const sizeStr = String(alert.position_size || '0');
+  const signalType = alert.signal_type;  // "entry" / "exit"
+  const leverage = alert.leverage || 1;
+
   try {
-    await handleSignal(alert);
-    res.status(200).json({ ok: true });
+    if (!apexClient || !apexReady) {
+      console.log('🧪 [LOG_ONLY]', signalType, 'order for', symbol, {
+        botId,
+        side,
+        orderType,
+        sizeStr,
+        leverage
+      });
+    } else {
+      // ---------------------------------------------------
+      // ⚠️ 下面这段是“真实下单”的示意代码，基于 Python 的 create_order_v3。
+      // 你后面可以根据官方 Node 示例调整字段名字。
+      // ---------------------------------------------------
+      const nowSeconds = Math.floor(Date.now() / 1000);
+
+      if (signalType === 'entry') {
+        console.log('🟢 [LIVE] Sending ENTRY order to ApeX...');
+
+        const resOrder = await apexClient.privateApi.create_order_v3({
+          symbol: symbol.replace('USDT', '-USDT'),  // TV: ZECUSDT  -> API: ZEC-USDT（如果 API 要这种格式）
+          side: side,          // "BUY" / "SELL"
+          type: orderType,     // "MARKET"
+          size: sizeStr,       // 必须是字符串
+          timestampSeconds: nowSeconds.toString(),
+          // 市价单可以随便给一个 price，真正成交价以市场为准
+          price: '0'
+        });
+
+        console.log('✅ [LIVE] Entry order result:', resOrder);
+      } else if (signalType === 'exit') {
+        console.log('🔴 [LIVE] Sending EXIT order to ApeX...');
+
+        // 这里 exit 我同样用 create_order_v3 + 反方向下单
+        // 真实情况你可以根据仓位方向决定 size / side
+        const resOrder = await apexClient.privateApi.create_order_v3({
+          symbol: symbol.replace('USDT', '-USDT'),
+          side: side,
+          type: orderType,
+          size: sizeStr,
+          timestampSeconds: nowSeconds.toString(),
+          price: '0',
+          reduceOnly: true // 如果 SDK 支持这个字段，可以避免开反向新仓
+        });
+
+        console.log('✅ [LIVE] Exit order result:', resOrder);
+      } else {
+        console.log('ℹ️ Unknown signal_type:', signalType, '— only logging');
+      }
+    }
+
+    res.status(200).send('OK');
   } catch (err) {
-    console.error('❌ Error in handleSignal:', err);
-    res.status(500).json({ ok: false, error: 'internal_error' });
+    console.error('❌ Error handling alert:', err);
+    res.status(500).send('Error');
   }
 });
 
-// 启动服务器
+// -------------------------------------------------------
+// 3) 启动服务器
+// -------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`🚀 ApeX-bot listening on port ${PORT}`);
+  console.log(`🚀 Apex-bot listening on port ${PORT}`);
 });
