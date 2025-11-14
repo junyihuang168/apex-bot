@@ -1,129 +1,133 @@
-// index.js
-// TradingView → DigitalOcean → （将来接 ApeX）
-// 目前：
-//   1. 接收 TV Webhook
-//   2. 读取 ApeX API 环境变量（不打印具体值）
-//   3. 按 entry / exit 打日志（模拟下单）
-//   4. 可以直接部署使用，不会暴露任何密钥
+// =========================================================
+//  APEX REAL ORDER BOT  (Live Trading Version)
+//  TradingView → DigitalOcean → Apex Pro (Omni)
+// =========================================================
 
-const express = require('express');
-const app = express();
+import express from 'express'
+import crypto from 'crypto'
+import axios from 'axios'
+import bodyParser from 'body-parser'
 
-// ==========================
-// 读取环境变量（只读名字，不泄露值）
-// ==========================
-const APEX_API_KEY = process.env.APEX_API_KEY;
-const APEX_API_SECRET = process.env.APEX_API_SECRET;
-const APEX_API_PASSPHRASE = process.env.APEX_API_PASSPHRASE;
-const APEX_OMNI_PRIVATE_KEY = process.env.APEX_OMNI_PRIVATE_KEY;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const app = express()
+app.use(bodyParser.json())
 
-// 启动时检查一下必要环境变量是否存在
-function checkEnv() {
-  const missing = [];
-  if (!APEX_API_KEY) missing.push('APEX_API_KEY');
-  if (!APEX_API_SECRET) missing.push('APEX_API_SECRET');
-  if (!APEX_API_PASSPHRASE) missing.push('APEX_API_PASSPHRASE');
-  if (!APEX_OMNI_PRIVATE_KEY) missing.push('APEX_OMNI_PRIVATE_KEY');
-  if (!WEBHOOK_SECRET) missing.push('WEBHOOK_SECRET');
+// ======================
+// Load Env Variables
+// ======================
+const APEX_KEY        = process.env.APEX_API_KEY
+const APEX_SECRET     = process.env.APEX_API_SECRET
+const APEX_PASSPHRASE = process.env.APEX_API_PASSPHRASE
+const OMNI_KEY        = process.env.APEX_OMNI_PRIVATE_KEY
+const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET
 
-  if (missing.length > 0) {
-    console.warn('⚠️ Missing env vars:', missing.join(', '));
-    console.warn('⚠️ 请到 DigitalOcean → App → Settings → Environment Variables 补齐这些变量。');
-  } else {
-    console.log('✅ ApeX & Webhook 环境变量已加载（不会在日志中显示具体值）');
-  }
+// ======================
+// APEX API Base URL
+// ======================
+const BASE = "https://api.apex.exchange"   // LIVE endpoint
+
+
+// ========================================================
+// Helper: Sign Apex Request
+// ========================================================
+function signRequest(method, path, body = "") {
+    const timestamp = Math.floor(Date.now() / 1000).toString()
+    const prehash = timestamp + method + path + body
+
+    const signature = crypto
+        .createHmac("sha256", APEX_SECRET)
+        .update(prehash)
+        .digest("hex")
+
+    return { timestamp, signature }
 }
-checkEnv();
 
-// 让 Express 能解析 JSON body
-app.use(express.json());
 
-// 全局日志：任何请求都会先打印一行
-app.use((req, res, next) => {
-  console.log('🌐 Incoming request:', req.method, req.url);
-  next();
-});
+// ========================================================
+// Create Order (LIVE)
+// ========================================================
+async function sendOrder(symbol, side, size, leverage, type = "market") {
 
-// 根路径：方便你在浏览器里测试服务是不是活着
-app.get('/', (req, res) => {
-  res.send('Apex-bot is running ✅');
-});
+    const path = "/v1/orders"
+    const bodyObj = {
+        symbol: symbol,
+        side: side,              // "buy" / "sell"
+        orderType: type,         // "market"
+        size: size.toString(),   // in USDT
+        leverage: leverage,      // number
+        signature: OMNI_KEY      // wallet signature
+    }
 
-// ==========================
-// TradingView Webhook 主入口
-// ==========================
+    const bodyStr = JSON.stringify(bodyObj)
+    const { timestamp, signature } = signRequest("POST", path, bodyStr)
+
+    try {
+        const res = await axios.post(
+            BASE + path,
+            bodyObj,
+            {
+                headers: {
+                    "APEX-KEY": APEX_KEY,
+                    "APEX-TIMESTAMP": timestamp,
+                    "APEX-SIGN": signature,
+                    "APEX-PASSPHRASE": APEX_PASSPHRASE,
+                    "Content-Type": "application/json"
+                }
+            }
+        )
+
+        console.log("✅ LIVE Order Sent:", res.data)
+        return res.data
+
+    } catch (err) {
+        console.log("❌ LIVE Order Error:", err?.response?.data || err)
+        return null
+    }
+}
+
+
+// ========================================================
+// TradingView Webhook
+// ========================================================
 app.post('/tv-webhook', async (req, res) => {
-  console.log('🔥 Webhook hit on /tv-webhook');
 
-  // 打印 header（方便调试）
-  console.log('🧾 Headers:', JSON.stringify(req.headers, null, 2));
+    console.log("🔥 Webhook Received:", req.body)
 
-  // 打印 body（TradingView 发送的内容）
-  console.log('📩 Body from TradingView:', JSON.stringify(req.body, null, 2));
-
-  const alert = req.body; // TradingView 发来的 JSON
-
-  // ======（可选）校验 Webhook Secret，防止别人乱打=====
-  // 你可以在 TV 的消息里加一个字段，比如：
-  // { "secret": "xxxx", "bot_id": "BOT_1", ... }
-  // 然后在这里比对：
-  //
-  // if (WEBHOOK_SECRET && alert.secret !== WEBHOOK_SECRET) {
-  //   console.log('⛔ Webhook secret 不匹配，拒绝处理');
-  //   return res.status(403).send('Forbidden');
-  // }
-
-  // 简单检查一下 payload 是否正常
-  if (!alert || !alert.bot_id || !alert.symbol || !alert.signal_type) {
-    console.log('⚠️ Invalid alert payload, ignoring');
-    return res.status(400).send('Invalid alert');
-  }
-
-  try {
-    // ======================
-    // Entry 信号（开仓逻辑）
-    // ======================
-    if (alert.signal_type === 'entry') {
-      // TODO: 将来在这里接 ApeX 真实下单逻辑
-      // 例如调用 placeApexOrder({ ...alert, ... })
-
-      console.log(
-        '✅ [模拟] Entry order to Apex:',
-        alert.symbol,
-        alert.side,
-        'size =',
-        alert.position_size,
-        'leverage =',
-        alert.leverage
-      );
+    if (!req.body || !req.body.bot_id || !req.body.signal_type) {
+        return res.status(400).send("Bad payload")
     }
 
-    // ======================
-    // Exit 信号（平仓逻辑）
-    // ======================
-    if (alert.signal_type === 'exit') {
-      // TODO: 将来在这里接 ApeX 平仓逻辑
-      // 例如调用 closeApexPosition({ symbol: alert.symbol, botId: alert.bot_id })
+    const alert = req.body
+    const symbol      = alert.symbol
+    const side        = alert.side
+    const size        = alert.position_size
+    const leverage    = alert.leverage || 1
+    const signal_type = alert.signal_type
 
-      console.log('✅ [模拟] Exit order to Apex:', alert.symbol);
+    try {
+        if (signal_type === "entry") {
+
+            console.log(`🚀 LIVE ENTRY → ${symbol} ${side} size=${size}`)
+            await sendOrder(symbol, side, size, leverage, "market")
+        }
+
+        if (signal_type === "exit") {
+
+            console.log(`📤 LIVE EXIT → ${symbol}`)
+            await sendOrder(symbol, side, size, leverage, "market")
+        }
+
+        res.status(200).send("OK")
+
+    } catch (err) {
+        console.log("❌ Error handling webhook:", err)
+        res.status(500).send("Error")
     }
+})
 
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('❌ Error handling alert:', err);
-    res.status(500).send('Error');
-  }
-});
 
-// 兜底 404（也打印出来，方便排查）
-app.use((req, res) => {
-  console.log('❓ No route matched for:', req.method, req.url);
-  res.status(404).send('Not found');
-});
-
-// 启动服务器
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Apex-bot listening on port ${PORT}`);
-});
+// ========================================================
+// Start Server
+// ========================================================
+app.listen(8080, () => {
+    console.log("🚀 Apex LIVE Bot Running on port 8080")
+})
