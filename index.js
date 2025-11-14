@@ -1,133 +1,64 @@
-// =========================================================
-//  APEX REAL ORDER BOT  (Live Trading Version)
-//  TradingView → DigitalOcean → Apex Pro (Omni)
-// =========================================================
+// index.js  —— 先跑一个稳定、安全的版本（目前还是“模拟下单”，只打印日志）
 
-import express from 'express'
-import crypto from 'crypto'
-import axios from 'axios'
-import bodyParser from 'body-parser'
+const express = require('express');
 
-const app = express()
-app.use(bodyParser.json())
+const app = express();
+const PORT = process.env.PORT || 8080;
 
-// ======================
-// Load Env Variables
-// ======================
-const APEX_KEY        = process.env.APEX_API_KEY
-const APEX_SECRET     = process.env.APEX_API_SECRET
-const APEX_PASSPHRASE = process.env.APEX_API_PASSPHRASE
-const OMNI_KEY        = process.env.APEX_OMNI_PRIVATE_KEY
-const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET
+// 解析 TradingView 发来的 JSON / 表单
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// ======================
-// APEX API Base URL
-// ======================
-const BASE = "https://api.apex.exchange"   // LIVE endpoint
+// 主页检查用
+app.get('/', (req, res) => {
+  res.send('Apex-bot is running ✅');
+});
 
+// TradingView Webhook 入口
+app.post('/tv-webhook', (req, res) => {
+  console.log('🌐 Incoming request: POST /tv-webhook');
 
-// ========================================================
-// Helper: Sign Apex Request
-// ========================================================
-function signRequest(method, path, body = "") {
-    const timestamp = Math.floor(Date.now() / 1000).toString()
-    const prehash = timestamp + method + path + body
+  // TradingView 发送过来的 body
+  const alert = req.body || {};
+  console.log('📦 Body from TradingView:', JSON.stringify(alert, null, 2));
 
-    const signature = crypto
-        .createHmac("sha256", APEX_SECRET)
-        .update(prehash)
-        .digest("hex")
+  // 简单校验一下必填字段
+  if (!alert.bot_id || !alert.symbol || !alert.side || !alert.signal_type) {
+    console.log('⚠️ Invalid alert payload, ignoring');
+    return res.status(400).send('Invalid alert');
+  }
 
-    return { timestamp, signature }
-}
+  const botId       = alert.bot_id;
+  const symbol      = alert.symbol;
+  const side        = alert.side;               // "buy" / "sell"
+  const size        = Number(alert.position_size) || 0;
+  const orderType   = alert.order_type || 'market';
+  const leverage    = Number(alert.leverage) || 1;
+  const signalType  = alert.signal_type;        // "entry" / "exit"
 
+  console.log(`🧾 Parsed alert:
+    bot_id     = ${botId}
+    symbol     = ${symbol}
+    side       = ${side}
+    size       = ${size}
+    orderType  = ${orderType}
+    leverage   = ${leverage}
+    signalType = ${signalType}
+  `);
 
-// ========================================================
-// Create Order (LIVE)
-// ========================================================
-async function sendOrder(symbol, side, size, leverage, type = "market") {
+  // 目前先不真正发单，只在日志里做“模拟下单”
+  if (signalType === 'entry') {
+    console.log(`✅ [模拟] Entry order to Apex: ${symbol} ${side} size = ${size} leverage = ${leverage}`);
+  } else if (signalType === 'exit') {
+    console.log(`✅ [模拟] Exit order to Apex: ${symbol} side = ${side} size = ${size} leverage = ${leverage}`);
+  } else {
+    console.log('⚠️ Unknown signal_type, ignoring');
+  }
 
-    const path = "/v1/orders"
-    const bodyObj = {
-        symbol: symbol,
-        side: side,              // "buy" / "sell"
-        orderType: type,         // "market"
-        size: size.toString(),   // in USDT
-        leverage: leverage,      // number
-        signature: OMNI_KEY      // wallet signature
-    }
+  // 必须返回 200，TradingView 才会认为成功
+  res.status(200).send('OK');
+});
 
-    const bodyStr = JSON.stringify(bodyObj)
-    const { timestamp, signature } = signRequest("POST", path, bodyStr)
-
-    try {
-        const res = await axios.post(
-            BASE + path,
-            bodyObj,
-            {
-                headers: {
-                    "APEX-KEY": APEX_KEY,
-                    "APEX-TIMESTAMP": timestamp,
-                    "APEX-SIGN": signature,
-                    "APEX-PASSPHRASE": APEX_PASSPHRASE,
-                    "Content-Type": "application/json"
-                }
-            }
-        )
-
-        console.log("✅ LIVE Order Sent:", res.data)
-        return res.data
-
-    } catch (err) {
-        console.log("❌ LIVE Order Error:", err?.response?.data || err)
-        return null
-    }
-}
-
-
-// ========================================================
-// TradingView Webhook
-// ========================================================
-app.post('/tv-webhook', async (req, res) => {
-
-    console.log("🔥 Webhook Received:", req.body)
-
-    if (!req.body || !req.body.bot_id || !req.body.signal_type) {
-        return res.status(400).send("Bad payload")
-    }
-
-    const alert = req.body
-    const symbol      = alert.symbol
-    const side        = alert.side
-    const size        = alert.position_size
-    const leverage    = alert.leverage || 1
-    const signal_type = alert.signal_type
-
-    try {
-        if (signal_type === "entry") {
-
-            console.log(`🚀 LIVE ENTRY → ${symbol} ${side} size=${size}`)
-            await sendOrder(symbol, side, size, leverage, "market")
-        }
-
-        if (signal_type === "exit") {
-
-            console.log(`📤 LIVE EXIT → ${symbol}`)
-            await sendOrder(symbol, side, size, leverage, "market")
-        }
-
-        res.status(200).send("OK")
-
-    } catch (err) {
-        console.log("❌ Error handling webhook:", err)
-        res.status(500).send("Error")
-    }
-})
-
-
-// ========================================================
-// Start Server
-// ========================================================
-app.listen(8080, () => {
-    console.log("🚀 Apex LIVE Bot Running on port 8080")
-})
+app.listen(PORT, () => {
+  console.log(`🚀 Apex-bot listening on port ${PORT}`);
+});
