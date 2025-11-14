@@ -4,7 +4,7 @@
 //   1. 接收 TV Webhook
 //   2. 读取 ApeX API 环境变量（不打印具体值）
 //   3. 按 entry / exit 打日志（模拟下单）
-//   4. 整个文件可以直接部署使用
+//   4. 可以直接部署使用，不会暴露任何密钥
 
 const express = require('express');
 const app = express();
@@ -15,6 +15,7 @@ const app = express();
 const APEX_API_KEY = process.env.APEX_API_KEY;
 const APEX_API_SECRET = process.env.APEX_API_SECRET;
 const APEX_API_PASSPHRASE = process.env.APEX_API_PASSPHRASE;
+const APEX_OMNI_PRIVATE_KEY = process.env.APEX_OMNI_PRIVATE_KEY;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
 // 启动时检查一下必要环境变量是否存在
@@ -23,6 +24,7 @@ function checkEnv() {
   if (!APEX_API_KEY) missing.push('APEX_API_KEY');
   if (!APEX_API_SECRET) missing.push('APEX_API_SECRET');
   if (!APEX_API_PASSPHRASE) missing.push('APEX_API_PASSPHRASE');
+  if (!APEX_OMNI_PRIVATE_KEY) missing.push('APEX_OMNI_PRIVATE_KEY');
   if (!WEBHOOK_SECRET) missing.push('WEBHOOK_SECRET');
 
   if (missing.length > 0) {
@@ -54,7 +56,7 @@ app.get('/', (req, res) => {
 app.post('/tv-webhook', async (req, res) => {
   console.log('🔥 Webhook hit on /tv-webhook');
 
-  // 打印 header（可选，方便调试）
+  // 打印 header（方便调试）
   console.log('🧾 Headers:', JSON.stringify(req.headers, null, 2));
 
   // 打印 body（TradingView 发送的内容）
@@ -64,7 +66,7 @@ app.post('/tv-webhook', async (req, res) => {
 
   // ======（可选）校验 Webhook Secret，防止别人乱打=====
   // 你可以在 TV 的消息里加一个字段，比如：
-  // { "secret": "xxxx", "bot_id": "...", ... }
+  // { "secret": "xxxx", "bot_id": "BOT_1", ... }
   // 然后在这里比对：
   //
   // if (WEBHOOK_SECRET && alert.secret !== WEBHOOK_SECRET) {
@@ -85,6 +87,7 @@ app.post('/tv-webhook', async (req, res) => {
     if (alert.signal_type === 'entry') {
       // TODO: 将来在这里接 ApeX 真实下单逻辑
       // 例如调用 placeApexOrder({ ...alert, ... })
+
       console.log(
         '✅ [模拟] Entry order to Apex:',
         alert.symbol,
@@ -102,6 +105,7 @@ app.post('/tv-webhook', async (req, res) => {
     if (alert.signal_type === 'exit') {
       // TODO: 将来在这里接 ApeX 平仓逻辑
       // 例如调用 closeApexPosition({ symbol: alert.symbol, botId: alert.bot_id })
+
       console.log('✅ [模拟] Exit order to Apex:', alert.symbol);
     }
 
