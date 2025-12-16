@@ -2,15 +2,15 @@ import os
 import time
 import threading
 from decimal import Decimal
-from typing import Dict, Tuple, Optional, Set
+from typing import Dict, Tuple, Optional, Set, Any
 
 from flask import Flask, request, jsonify, Response
 
 from apex_client import (
     create_market_order,
     get_market_price,
-    get_fill_summary,              # ✅ 新增：仓库逻辑-真实成交回写
-    get_open_position_for_symbol,  # ✅ 新增：仓库逻辑-远程查仓
+    get_fill_summary,              # ✅ 真实成交回写（保持你原逻辑）
+    get_open_position_for_symbol,  # ✅ 远程查仓兜底（按你规则严格限制触发）
     map_position_side_to_exit_order_side,
     _get_symbol_rules,
     _snap_quantity,
@@ -26,6 +26,9 @@ from pnl_store import (
     get_lock_level_pct,
     set_lock_level_pct,
     clear_lock_level_pct,
+    # ✅ 新增：幂等去重
+    is_signal_processed,
+    mark_signal_processed,
 )
 
 app = Flask(__name__)
@@ -35,6 +38,21 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 # Dashboard token（可选）
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
+# 退出互斥窗口（秒）：防止 webhook exit 与 risk exit 同时触发重复平仓
+EXIT_COOLDOWN_SEC = float(os.getenv("EXIT_COOLDOWN_SEC", "2.0"))
+
+# 远程兜底白名单：只有本地无 lots 且 symbol 在白名单，才允许 remote fallback
+# 例：REMOTE_FALLBACK_SYMBOLS="ZEC-USDT,BTC-USDT"
+REMOTE_FALLBACK_SYMBOLS = {
+    s.strip().upper() for s in os.getenv("REMOTE_FALLBACK_SYMBOLS", "").split(",") if s.strip()
+}
+
+# 风控轮询间隔
+RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
+
+# ✅ 基础止损默认 0.5%
+BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
+
 def _require_token() -> bool:
     if not DASHBOARD_TOKEN:
         return True
@@ -43,7 +61,33 @@ def _require_token() -> bool:
 
 
 def _parse_bot_list(env_val: str) -> Set[str]:
-    return {b.strip() for b in env_val.split(",") if b.strip()}
+    return {b.strip().upper() for b in env_val.split(",") if b.strip()}
+
+
+def _canon_bot_id(bot_id: str) -> str:
+    """
+    Canonicalize bot id:
+    - Accept: "BOT_1", "bot1", "bot_1", "BOT 1"
+    - Output: "BOT_1"
+    """
+    s = str(bot_id or "").strip().upper().replace(" ", "").replace("-", "_")
+    if not s:
+        return "BOT_0"
+
+    if s.startswith("BOT_"):
+        core = s[4:]
+    elif s.startswith("BOT"):
+        core = s[3:]
+    else:
+        # If user passes pure number "1"
+        core = s
+
+    core = core.replace("_", "")
+    if core.isdigit():
+        return f"BOT_{int(core)}"
+    # fallback
+    return s
+
 
 # BOT 1-10：做多风控
 LONG_LADDER_BOTS = _parse_bot_list(
@@ -55,17 +99,29 @@ SHORT_LADDER_BOTS = _parse_bot_list(
     os.getenv("SHORT_LADDER_BOTS", ",".join([f"BOT_{i}" for i in range(11, 21)]))
 )
 
-# ✅ 基础止损默认 0.5%
-BASE_SL_PCT = Decimal(os.getenv("BASE_SL_PCT", "0.5"))
-
-# 风控轮询间隔
-RISK_POLL_INTERVAL = float(os.getenv("RISK_POLL_INTERVAL", "2.0"))
-
 # 本地 cache（仅辅助）
 BOT_POSITIONS: Dict[Tuple[str, str], dict] = {}
 
 _MONITOR_THREAD_STARTED = False
 _MONITOR_LOCK = threading.Lock()
+
+# ✅ 退出互斥：bot+symbol 粒度 cooldown
+_EXIT_LOCK = threading.Lock()
+_LAST_EXIT_TS: Dict[Tuple[str, str], float] = {}
+
+
+def _exit_guard_allow(bot_id: str, symbol: str) -> bool:
+    """
+    Return True if allowed to execute an exit now; False if within cooldown window.
+    """
+    key = (_canon_bot_id(bot_id), str(symbol or "").upper().strip())
+    now = time.time()
+    with _EXIT_LOCK:
+        last = _LAST_EXIT_TS.get(key, 0.0)
+        if now - last < EXIT_COOLDOWN_SEC:
+            return False
+        _LAST_EXIT_TS[key] = now
+        return True
 
 
 # ----------------------------
@@ -116,6 +172,33 @@ def _order_status_and_reason(order: dict):
 
 
 # ----------------------------
+# 幂等 Signal ID（webhook）
+# ----------------------------
+def _get_signal_id(body: dict, mode: str, bot_id: str, symbol: str) -> str:
+    """
+    Prefer user-provided ids:
+    - signal_id / alert_id / id / tv_id
+    Otherwise generate a stable-ish id by timestamp + core fields.
+    """
+    for k in ("signal_id", "alert_id", "id", "tv_id", "client_id"):
+        v = body.get(k)
+        if v:
+            return f"{mode}:{bot_id}:{symbol}:{str(v)}"
+
+    # fallback to time bucket (seconds) to dedup typical retries
+    ts = body.get("ts") or body.get("time") or int(time.time())
+    try:
+        ts_int = int(float(str(ts)))
+    except Exception:
+        ts_int = int(time.time())
+
+    sig = str(body.get("signal_type") or body.get("action") or "").lower().strip()
+    side = str(body.get("side") or "").upper().strip()
+
+    return f"{mode}:{bot_id}:{symbol}:{sig}:{side}:{ts_int}"
+
+
+# ----------------------------
 # 你的阶梯锁盈规则 (Local Ladder Logic - Original)
 # ----------------------------
 TRIGGER_1 = Decimal("0.18")
@@ -123,6 +206,7 @@ LOCK_1 = Decimal("0.10")
 TRIGGER_2 = Decimal("0.38")
 LOCK_2 = Decimal("0.20")
 STEP = Decimal("0.20")
+
 
 def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
     if pnl_pct < TRIGGER_1:
@@ -134,6 +218,7 @@ def _desired_lock_level_pct(pnl_pct: Decimal) -> Decimal:
 
 
 def _bot_allows_direction(bot_id: str, direction: str) -> bool:
+    bot_id = _canon_bot_id(bot_id)
     d = direction.upper()
     if bot_id in LONG_LADDER_BOTS and d == "LONG":
         return True
@@ -150,7 +235,7 @@ def _get_current_price(symbol: str, direction: str) -> Optional[Decimal]:
         px_str = get_market_price(symbol, exit_side, str(min_qty))
         return Decimal(str(px_str))
     except Exception as e:
-        print(f"[RISK] get_market_price error symbol={symbol} direction={direction}:", e)
+        print(f"[RISK] get_market_price error symbol={symbol} direction={direction}: {e}")
         return None
 
 
@@ -186,26 +271,47 @@ def _lock_hit(direction: str, entry_price: Decimal, current_price: Decimal, lock
 
 
 def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal, reason: str):
+    """
+    Risk-thread exit. Uses lots as truth source (same as your original),
+    adds:
+    - exit cooldown guard (avoid duplicates)
+    - processed_signals idempotency record
+    """
+    bot_id = _canon_bot_id(bot_id)
+    symbol_u = str(symbol or "").upper().strip()
+    direction_u = direction.upper()
+
     if qty <= 0:
         return
 
-    direction_u = direction.upper()
+    # cooldown guard
+    if not _exit_guard_allow(bot_id, symbol_u):
+        print(f"[RISK] EXIT SKIP (cooldown) bot={bot_id} symbol={symbol_u} reason={reason}")
+        return
+
+    # idempotency key
+    sig_id = f"risk_exit:{bot_id}:{symbol_u}:{direction_u}:{reason}:{int(time.time())}"
+    if is_signal_processed(bot_id, sig_id):
+        print(f"[RISK] EXIT SKIP (dedup) bot={bot_id} symbol={symbol_u} reason={reason} sig={sig_id}")
+        return
+    mark_signal_processed(bot_id, sig_id, kind="risk_exit")
+
     entry_side = "BUY" if direction_u == "LONG" else "SELL"
     exit_side = "SELL" if direction_u == "LONG" else "BUY"
 
-    exit_price = _get_current_price(symbol, direction_u)
+    exit_price = _get_current_price(symbol_u, direction_u)
     if exit_price is None:
-        print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol}")
+        print(f"[RISK] skip exit due to no price bot={bot_id} symbol={symbol_u}")
         return
 
     print(
-        f"[RISK] EXIT bot={bot_id} symbol={symbol} direction={direction_u} "
-        f"qty={qty} reason={reason}"
+        f"[RISK] EXIT bot={bot_id} symbol={symbol_u} direction={direction_u} "
+        f"qty={qty} reason={reason} ref_exit={exit_price}"
     )
 
     try:
         order = create_market_order(
-            symbol=symbol,
+            symbol=symbol_u,
             side=exit_side,
             size=str(qty),
             reduce_only=True,
@@ -217,11 +323,11 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
         if status in ("CANCELED", "REJECTED"):
             return
 
-        # ✅ FIFO 记账，仅扣该 bot 自己的 lots
+        # FIFO 记账，仅扣该 bot 自己的 lots
         try:
             record_exit_fifo(
                 bot_id=bot_id,
-                symbol=symbol,
+                symbol=symbol_u,
                 entry_side=entry_side,
                 exit_qty=qty,
                 exit_price=exit_price,
@@ -232,12 +338,12 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
 
         # 清理锁盈状态
         try:
-            clear_lock_level_pct(bot_id, symbol, direction_u)
+            clear_lock_level_pct(bot_id, symbol_u, direction_u)
         except Exception:
             pass
 
         # 本地 cache 清理（非真相源）
-        key = (bot_id, symbol)
+        key = (bot_id, symbol_u)
         pos = BOT_POSITIONS.get(key)
         if pos:
             pos_qty = Decimal(str(pos.get("qty") or "0"))
@@ -249,7 +355,7 @@ def _execute_virtual_exit(bot_id: str, symbol: str, direction: str, qty: Decimal
                 pos["entry_price"] = None
 
     except Exception as e:
-        print(f"[RISK] create_market_order error bot={bot_id} symbol={symbol}:", e)
+        print(f"[RISK] create_market_order error bot={bot_id} symbol={symbol_u}: {e}")
 
 
 def _risk_loop():
@@ -259,9 +365,11 @@ def _risk_loop():
             bots = sorted(list(LONG_LADDER_BOTS | SHORT_LADDER_BOTS))
 
             for bot_id in bots:
+                bot_id = _canon_bot_id(bot_id)
                 opens = get_bot_open_positions(bot_id)
 
                 for (symbol, direction), v in opens.items():
+                    symbol_u = str(symbol or "").upper().strip()
                     direction_u = direction.upper()
 
                     if not _bot_allows_direction(bot_id, direction_u):
@@ -273,7 +381,7 @@ def _risk_loop():
                     if qty <= 0 or entry_price <= 0:
                         continue
 
-                    current_price = _get_current_price(symbol, direction_u)
+                    current_price = _get_current_price(symbol_u, direction_u)
                     if current_price is None:
                         continue
 
@@ -283,7 +391,7 @@ def _risk_loop():
                     if _base_sl_hit(direction_u, entry_price, current_price):
                         _execute_virtual_exit(
                             bot_id=bot_id,
-                            symbol=symbol,
+                            symbol=symbol_u,
                             direction=direction_u,
                             qty=qty,
                             reason="base_sl_exit",
@@ -292,13 +400,13 @@ def _risk_loop():
 
                     # 2) 计算目标锁盈档位 (Local Ladder Logic)
                     desired_lock = _desired_lock_level_pct(pnl_pct)
-                    current_lock = get_lock_level_pct(bot_id, symbol, direction_u)
+                    current_lock = get_lock_level_pct(bot_id, symbol_u, direction_u)
 
                     if desired_lock > current_lock:
-                        set_lock_level_pct(bot_id, symbol, direction_u, desired_lock)
+                        set_lock_level_pct(bot_id, symbol_u, direction_u, desired_lock)
                         current_lock = desired_lock
                         print(
-                            f"[RISK] LOCK UP bot={bot_id} symbol={symbol} direction={direction_u} "
+                            f"[RISK] LOCK UP bot={bot_id} symbol={symbol_u} direction={direction_u} "
                             f"pnl={pnl_pct:.4f}% lock_level={current_lock}%"
                         )
 
@@ -306,7 +414,7 @@ def _risk_loop():
                     if _lock_hit(direction_u, entry_price, current_price, current_lock):
                         _execute_virtual_exit(
                             bot_id=bot_id,
-                            symbol=symbol,
+                            symbol=symbol_u,
                             direction=direction_u,
                             qty=qty,
                             reason="ladder_lock_exit",
@@ -348,10 +456,12 @@ def api_pnl():
     bots = list_bots_with_activity()
     only_bot = request.args.get("bot_id")
     if only_bot:
-        bots = [b for b in bots if b == only_bot]
+        only_bot = _canon_bot_id(only_bot)
+        bots = [b for b in bots if _canon_bot_id(b) == only_bot]
 
     out = []
     for bot_id in bots:
+        bot_id = _canon_bot_id(bot_id)
         base = get_bot_summary(bot_id)
         opens = get_bot_open_positions(bot_id)
 
@@ -374,7 +484,7 @@ def api_pnl():
                 unrealized += (wentry - px) * qty
 
             open_rows.append({
-                "symbol": symbol,
+                "symbol": str(symbol).upper(),
                 "direction": direction.upper(),
                 "qty": str(qty),
                 "weighted_entry": str(wentry),
@@ -450,7 +560,7 @@ def dashboard():
 <header>
   <div>
     <h1>Bot PnL Dashboard</h1>
-    <div class="muted">独立 lots 记账 · 真实成交价优先 · 基础止损默认 0.5% · 阶梯锁盈</div>
+    <div class="muted">独立 lots 记账 · 真实成交价优先 · 基础止损默认 0.5% · 阶梯锁盈 · Exit cooldown 防重复</div>
   </div>
   <div class="muted" id="lastUpdate">Loading...</div>
 </header>
@@ -474,7 +584,7 @@ def dashboard():
         <div class="group">
           <span class="pill">BOT 1-10: LONG 阶梯锁盈 + 基础SL(0.5%)</span>
           <span class="pill">BOT 11-20: SHORT 阶梯锁盈 + 基础SL(0.5%)</span>
-          <span class="pill">Others: Strategy-only</span>
+          <span class="pill">REMOTE_FALLBACK_SYMBOLS: 仅本地无 lots 才允许远程兜底</span>
         </div>
         <div class="small">数据来自 /api/pnl</div>
       </div>
@@ -635,8 +745,9 @@ def tv_webhook():
     symbol = body.get("symbol")
     if not symbol:
         return "missing symbol", 400
+    symbol = str(symbol).upper().strip()
 
-    bot_id = str(body.get("bot_id", "BOT_1"))
+    bot_id = _canon_bot_id(body.get("bot_id", "BOT_1"))
     side_raw = str(body.get("side", "")).upper()
     signal_type_raw = str(body.get("signal_type", "")).lower()
     action_raw = str(body.get("action", "")).lower()
@@ -656,6 +767,13 @@ def tv_webhook():
 
     if mode is None:
         return "missing or invalid signal_type / action", 400
+
+    # 4) idempotency (webhook)
+    sig_id = _get_signal_id(body, mode, bot_id, symbol)
+    if is_signal_processed(bot_id, sig_id):
+        print(f"[WEBHOOK] dedup: bot={bot_id} symbol={symbol} mode={mode} sig={sig_id}")
+        return jsonify({"status": "dedup", "mode": mode, "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
+    mark_signal_processed(bot_id, sig_id, kind=f"webhook_{mode}")
 
     # -------------------------
     # ENTRY
@@ -679,7 +797,7 @@ def tv_webhook():
         size_str = str(snapped_qty)
         print(
             f"[ENTRY] bot={bot_id} symbol={symbol} side={side_raw} "
-            f"budget={budget} -> qty={size_str}"
+            f"budget={budget} -> qty={size_str} sig={sig_id}"
         )
 
         try:
@@ -707,9 +825,10 @@ def tv_webhook():
                 "request_qty": size_str,
                 "order_status": status,
                 "cancel_reason": cancel_reason,
+                "signal_id": sig_id,
             }), 200
 
-        # ✅ 4) 仓库核心逻辑植入：真实成交价优先 (Real Executable Price)
+        # ✅ 真实成交价优先 (保持你原逻辑)
         computed = (order or {}).get("computed") or {}
         fallback_price_str = computed.get("price")
 
@@ -720,7 +839,6 @@ def tv_webhook():
         final_qty = snapped_qty
 
         try:
-            # 强制尝试获取真实成交
             fill = get_fill_summary(
                 symbol=symbol,
                 order_id=order_id,
@@ -735,7 +853,6 @@ def tv_webhook():
                 f"filled_qty={final_qty} avg_fill={entry_price_dec}"
             )
         except Exception as e:
-            # 无法拿到 fills → 回退 worst price 参考价
             print(f"[ENTRY] fill fallback bot={bot_id} symbol={symbol} err:", e)
             try:
                 if fallback_price_str is not None:
@@ -777,13 +894,20 @@ def tv_webhook():
             "order_status": status,
             "cancel_reason": cancel_reason,
             "order_id": order_id,
+            "signal_id": sig_id,
         }), 200
 
     # -------------------------
     # EXIT（策略出场）
-    # 以 lots 为准，裁剪只平本 bot
+    # lots 为准，裁剪只平本 bot
+    # 远程兜底：仅本地无 lots 且 symbol 在 REMOTE_FALLBACK_SYMBOLS
     # -------------------------
     if mode == "exit":
+        # exit cooldown guard
+        if not _exit_guard_allow(bot_id, symbol):
+            print(f"[EXIT] SKIP (cooldown) bot={bot_id} symbol={symbol} sig={sig_id}")
+            return jsonify({"status": "cooldown_skip", "mode": "exit", "bot_id": bot_id, "symbol": symbol, "signal_id": sig_id}), 200
+
         opens = get_bot_open_positions(bot_id)
 
         long_key = (symbol, "LONG")
@@ -811,16 +935,20 @@ def tv_webhook():
         elif short_qty > 0:
             direction_to_close, qty_to_close = "SHORT", short_qty
 
-        # ✅ 仓库核心逻辑植入：若本地无持仓，尝试远程查询兜底
-        if not direction_to_close or qty_to_close <= 0:
-            print(f"[EXIT] local 0 position, trying remote fallback for {symbol}...")
-            remote = get_open_position_for_symbol(symbol)
-            if remote and remote["size"] > 0:
-                direction_to_close = remote["side"] # LONG/SHORT
-                qty_to_close = remote["size"]
-                print(f"[EXIT] remote fallback found: {direction_to_close} {qty_to_close}")
+        # ✅ 远程兜底严格条件：本地无 lots + symbol 白名单允许
+        if (not direction_to_close or qty_to_close <= 0):
+            if symbol in REMOTE_FALLBACK_SYMBOLS:
+                print(f"[EXIT] local lots empty; REMOTE fallback allowed for symbol={symbol}. bot={bot_id} sig={sig_id}")
+                remote = get_open_position_for_symbol(symbol)
+                if remote and remote["size"] > 0:
+                    direction_to_close = remote["side"]  # LONG/SHORT
+                    qty_to_close = remote["size"]
+                    print(f"[EXIT] remote fallback found: {direction_to_close} {qty_to_close} symbol={symbol}")
+                else:
+                    print(f"[EXIT] no position to close (local empty + remote none). bot={bot_id} symbol={symbol}")
+                    return jsonify({"status": "no_position"}), 200
             else:
-                print(f"[EXIT] bot={bot_id} symbol={symbol}: no position to close (local+remote)")
+                print(f"[EXIT] local lots empty; remote fallback DISABLED (not whitelisted). bot={bot_id} symbol={symbol} sig={sig_id}")
                 return jsonify({"status": "no_position"}), 200
 
         entry_side = "BUY" if direction_to_close == "LONG" else "SELL"
@@ -828,7 +956,7 @@ def tv_webhook():
 
         print(
             f"[EXIT] bot={bot_id} symbol={symbol} direction={direction_to_close} "
-            f"qty={qty_to_close} -> exit_side={exit_side}"
+            f"qty={qty_to_close} -> exit_side={exit_side} sig={sig_id}"
         )
 
         try:
@@ -856,6 +984,7 @@ def tv_webhook():
                 "requested_qty": str(qty_to_close),
                 "order_status": status,
                 "cancel_reason": cancel_reason,
+                "signal_id": sig_id,
             }), 200
 
         exit_price = _get_current_price(symbol, direction_to_close) or Decimal("0")
@@ -890,6 +1019,7 @@ def tv_webhook():
             "closed_qty": str(qty_to_close),
             "order_status": status,
             "cancel_reason": cancel_reason,
+            "signal_id": sig_id,
         }), 200
 
     return "unsupported mode", 400
