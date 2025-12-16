@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import inspect
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Union, Tuple
 
@@ -26,6 +27,8 @@ SYMBOL_RULES: Dict[str, Dict[str, Any]] = {
 }
 
 _CLIENT: Optional[HttpPrivateSign] = None
+
+NumberLike = Union[str, float, int]
 
 
 def _get_symbol_rules(symbol: str) -> Dict[str, Any]:
@@ -84,6 +87,44 @@ def _random_client_id() -> str:
     return str(int(float(str(random.random())[2:])))
 
 
+def _safe_call(fn, **kwargs):
+    """
+    Call function with only supported kwargs (robust across SDK versions).
+    """
+    try:
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
+        call_kwargs = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        return fn(**call_kwargs)
+    except Exception:
+        # fallback: best-effort
+        return fn(**{k: v for k, v in kwargs.items() if v is not None})
+
+
+def _install_compat_shims(client: HttpPrivateSign):
+    """
+    DO NOT change business logic.
+    Only add alias methods for SDK version differences.
+    """
+    # get_account_v3 <-> accountV3
+    if not hasattr(client, "get_account_v3") and hasattr(client, "accountV3"):
+        client.get_account_v3 = getattr(client, "accountV3")  # type: ignore
+    if not hasattr(client, "accountV3") and hasattr(client, "get_account_v3"):
+        client.accountV3 = getattr(client, "get_account_v3")  # type: ignore
+
+    # configs_v3 <-> configsV3
+    if not hasattr(client, "configs_v3") and hasattr(client, "configsV3"):
+        client.configs_v3 = getattr(client, "configsV3")  # type: ignore
+    if not hasattr(client, "configsV3") and hasattr(client, "configs_v3"):
+        client.configsV3 = getattr(client, "configs_v3")  # type: ignore
+
+    # create_order_v3 <-> createOrderV3
+    if not hasattr(client, "create_order_v3") and hasattr(client, "createOrderV3"):
+        client.create_order_v3 = getattr(client, "createOrderV3")  # type: ignore
+    if not hasattr(client, "createOrderV3") and hasattr(client, "create_order_v3"):
+        client.createOrderV3 = getattr(client, "create_order_v3")  # type: ignore
+
+
 def get_client() -> HttpPrivateSign:
     global _CLIENT
     if _CLIENT is not None:
@@ -103,14 +144,17 @@ def get_client() -> HttpPrivateSign:
         api_key_credentials=api_creds,
     )
 
+    _install_compat_shims(client)
+
     try:
-        cfg = client.configs_v3()
+        cfg = _safe_call(client.configs_v3)
         print("[apex_client] configs_v3 ok:", cfg)
     except Exception as e:
         print("[apex_client] WARNING configs_v3 error:", e)
 
+    # 保留你原先的启动查仓行为（不改逻辑）
     try:
-        acc = client.get_account_v3()
+        acc = _safe_call(client.get_account_v3)
         print("[apex_client] get_account_v3 ok:", acc)
     except Exception as e:
         print("[apex_client] WARNING get_account_v3 error:", e)
@@ -121,7 +165,7 @@ def get_client() -> HttpPrivateSign:
 
 def get_account():
     client = get_client()
-    return client.get_account_v3()
+    return _safe_call(client.get_account_v3)
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
@@ -160,9 +204,6 @@ def get_market_price(symbol: str, side: str, size: str) -> str:
     return price_str
 
 
-NumberLike = Union[str, float, int]
-
-
 def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
     """
     尽量从 Apex 返回中拿 orderId / clientOrderId
@@ -190,7 +231,7 @@ def _extract_order_ids(raw_order: Any) -> Tuple[Optional[str], Optional[str]]:
 
 
 # ------------------------------------------------------------
-# ✅ 仓库逻辑植入：真实成交价格获取 (Real Executable Price)
+# ✅ 真实成交价格获取 (保持你原逻辑，不做你禁止的增强项)
 # ------------------------------------------------------------
 def get_fill_summary(
     symbol: str,
@@ -199,18 +240,12 @@ def get_fill_summary(
     max_wait_sec: float = 2.0,
     poll_interval: float = 0.25,
 ) -> Dict[str, Any]:
-    """
-    尝试用“你本地 apexomni 版本可能存在的任意方法”
-    拉真实成交信息。
-    如果拉不到，抛异常让上层回退到 worst price 参考价。
-    """
     client = get_client()
     start = time.time()
 
     while True:
         last_err = None
 
-        # 可能的候选方法名（不同版本 SDK 可能不一样）
         candidates = [
             "get_order_v3",
             "get_order_detail_v3",
@@ -223,12 +258,15 @@ def get_fill_summary(
             if hasattr(client, name) and order_id:
                 try:
                     fn = getattr(client, name)
-                    order_obj = fn(orderId=order_id) if "orderId" in fn.__code__.co_varnames else fn(order_id)
+                    # 保持你的原实现风格：尽量适配
+                    try:
+                        order_obj = fn(orderId=order_id)
+                    except Exception:
+                        order_obj = fn(order_id)
                     break
                 except Exception as e:
                     last_err = e
 
-        # 某些 SDK 可能有 fills 接口
         fills_obj = None
         fill_candidates = [
             "get_fills_v3",
@@ -239,20 +277,22 @@ def get_fill_summary(
             if hasattr(client, name):
                 try:
                     fn = getattr(client, name)
-                    # 尽量适配参数
-                    if order_id and "orderId" in fn.__code__.co_varnames:
-                        fills_obj = fn(orderId=order_id)
-                    elif client_order_id and "clientId" in fn.__code__.co_varnames:
-                        fills_obj = fn(clientId=client_order_id)
-                    elif order_id:
-                        fills_obj = fn(order_id)
+                    if order_id:
+                        try:
+                            fills_obj = fn(orderId=order_id)
+                        except Exception:
+                            fills_obj = fn(order_id)
+                    elif client_order_id:
+                        try:
+                            fills_obj = fn(clientId=client_order_id)
+                        except Exception:
+                            fills_obj = fn(client_order_id)
                     else:
                         continue
                     break
                 except Exception as e:
                     last_err = e
 
-        # 解析 fills 优先
         def _as_list(x):
             if x is None:
                 return []
@@ -297,7 +337,6 @@ def get_fill_summary(
                 "raw_fills": fills_obj,
             }
 
-        # 退而求其次：从 order_obj 里找 filledSize/avgPrice
         if isinstance(order_obj, dict):
             data = order_obj.get("data") if isinstance(order_obj.get("data"), dict) else order_obj
             if isinstance(data, dict):
@@ -334,14 +373,6 @@ def create_market_order(
     reduce_only: bool = False,
     client_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    MARKET 市价单。
-    返回 wrapper，包含：
-    - data
-    - raw_order
-    - computed(price/size/used_budget...)
-    - order_id / client_order_id（尽量提取）
-    """
     client = get_client()
     side = side.upper()
 
@@ -402,12 +433,10 @@ def create_market_order(
 
     print("[apex_client] create_market_order params:", params)
 
-    raw_order = client.create_order_v3(**params)
-
+    raw_order = _safe_call(client.create_order_v3, **params)
     print("[apex_client] order response:", raw_order)
 
     data = raw_order["data"] if isinstance(raw_order, dict) and "data" in raw_order else raw_order
-
     order_id, client_order_id = _extract_order_ids(raw_order)
 
     return {
@@ -425,11 +454,13 @@ def create_market_order(
         },
     }
 
+
 # ------------------------------------------------------------
-# ✅ 仓库逻辑植入：远程查仓兜底
+# ✅ 远程查仓兜底（保持你原逻辑）
 # ------------------------------------------------------------
 def _norm_symbol(s: str) -> str:
     return str(s or "").upper().replace("-", "").replace("_", "").strip()
+
 
 def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     try:
@@ -450,9 +481,11 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     target = _norm_symbol(symbol)
     for p in positions:
-        if not isinstance(p, dict): continue
+        if not isinstance(p, dict):
+            continue
         psym = _norm_symbol(p.get("symbol", ""))
-        if psym != target: continue
+        if psym != target:
+            continue
 
         size = p.get("size")
         side = str(p.get("side", "")).upper()
@@ -463,7 +496,8 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         except Exception:
             size_dec = Decimal("0")
 
-        if size_dec <= 0 or side not in ("LONG", "SHORT"): continue
+        if size_dec <= 0 or side not in ("LONG", "SHORT"):
+            continue
 
         entry_dec = None
         try:
@@ -480,6 +514,7 @@ def get_open_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "raw": p,
         }
     return None
+
 
 def map_position_side_to_exit_order_side(pos_side: str) -> str:
     s = str(pos_side).upper()
