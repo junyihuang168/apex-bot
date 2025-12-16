@@ -2,13 +2,18 @@ import os
 import sqlite3
 import time
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Tuple, Any, List
+from typing import Dict, Tuple, Any, List, Optional, Callable
 
 # ✅ 修改：使用绝对路径，避免不同运行环境找不到文件
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, os.getenv("PNL_DB_PATH", "pnl.sqlite3"))
 
 print(f"[PNL] Database path set to: {DB_PATH}")
+
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
+SQLITE_WRITE_RETRY = int(os.getenv("SQLITE_WRITE_RETRY", "5"))
+SQLITE_WRITE_RETRY_SLEEP = float(os.getenv("SQLITE_WRITE_RETRY_SLEEP", "0.15"))
+
 
 def _now() -> int:
     return int(time.time())
@@ -23,10 +28,43 @@ def _d(x) -> Decimal:
 
 
 def _connect():
-    # check_same_thread=False 允许在多线程(Webhook线程 vs 风控线程)中共享连接
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # timeout + busy_timeout reduce "database is locked" under multi-thread writes
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=max(1, SQLITE_BUSY_TIMEOUT_MS // 1000))
     conn.row_factory = sqlite3.Row
+
+    # PRAGMAs for concurrency stability
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+    except Exception:
+        pass
+
     return conn
+
+
+def _write_with_retry(fn: Callable[[sqlite3.Connection], Any]) -> Any:
+    last_err = None
+    for i in range(SQLITE_WRITE_RETRY):
+        try:
+            conn = _connect()
+            try:
+                out = fn(conn)
+                conn.commit()
+                return out
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            last_err = e
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                time.sleep(SQLITE_WRITE_RETRY_SLEEP * (i + 1))
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            raise
+    raise RuntimeError(f"[PNL] sqlite write failed after retries: {last_err!r}")
 
 
 def init_db():
@@ -80,8 +118,21 @@ def init_db():
         )
         """)
 
+        # ✅ NEW: processed signals for idempotency
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS processed_signals (
+            bot_id TEXT NOT NULL,
+            signal_id TEXT NOT NULL,
+            kind TEXT,
+            ts INTEGER NOT NULL,
+            PRIMARY KEY (bot_id, signal_id)
+        )
+        """)
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ps_bot_ts ON processed_signals(bot_id, ts)")
+
         conn.commit()
         conn.close()
         print("[PNL] Database initialized successfully.")
@@ -92,6 +143,41 @@ def init_db():
 def _side_to_direction(entry_side: str) -> str:
     s = str(entry_side).upper()
     return "LONG" if s == "BUY" else "SHORT"
+
+
+# ---------------------------
+# Idempotency helpers
+# ---------------------------
+def is_signal_processed(bot_id: str, signal_id: str) -> bool:
+    if not bot_id or not signal_id:
+        return False
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM processed_signals
+            WHERE bot_id=? AND signal_id=?
+            LIMIT 1
+        """, (str(bot_id), str(signal_id)))
+        row = cur.fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def mark_signal_processed(bot_id: str, signal_id: str, kind: str = ""):
+    if not bot_id or not signal_id:
+        return
+
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR IGNORE INTO processed_signals (bot_id, signal_id, kind, ts)
+            VALUES (?, ?, ?, ?)
+        """, (str(bot_id), str(signal_id), str(kind or ""), _now()))
+        return True
+
+    _write_with_retry(_w)
 
 
 def record_entry(
@@ -109,19 +195,18 @@ def record_entry(
     if q <= 0 or p <= 0:
         raise ValueError("record_entry requires qty>0 and price>0")
 
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        bot_id, symbol, direction, str(side).upper(),
-        str(q), str(p), str(q), reason, _now()
-    ))
-    conn.commit()
-    conn.close()
-    
-    # ✅ 增加日志确认
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            bot_id, symbol, direction, str(side).upper(),
+            str(q), str(p), str(q), reason, _now()
+        ))
+        return True
+
+    _write_with_retry(_w)
     print(f"[PNL] record_entry SUCCESS: bot={bot_id} {direction} {symbol} qty={q} @ {p}")
 
 
@@ -142,66 +227,67 @@ def record_exit_fifo(
     if need <= 0 or px_exit <= 0:
         raise ValueError("record_exit_fifo requires exit_qty>0 and exit_price>0")
 
-    conn = _connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT * FROM lots
-        WHERE bot_id=? AND symbol=? AND direction=? AND CAST(remaining_qty AS REAL) > 0
-        ORDER BY ts ASC, id ASC
-    """, (bot_id, symbol, direction))
-
-    rows = cur.fetchall()
-    if not rows:
-        conn.close()
-        print(f"[PNL] WARNING: record_exit_fifo found NO open lots for {bot_id} {symbol}")
-        return
-
-    ts = _now()
-    for r in rows:
-        if need <= 0:
-            break
-
-        lot_id = r["id"]
-        rem = _d(r["remaining_qty"])
-        entry_price = _d(r["entry_price"])
-
-        if rem <= 0:
-            continue
-
-        take = rem if rem <= need else need
-
-        # realized pnl
-        if direction == "LONG":
-            pnl = (px_exit - entry_price) * take
-        else:
-            pnl = (entry_price - px_exit) * take
-
-        new_rem = rem - take
-
-        # update lot remaining
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
         cur.execute("""
-            UPDATE lots SET remaining_qty=?
-            WHERE id=?
-        """, (str(new_rem), lot_id))
+            SELECT * FROM lots
+            WHERE bot_id=? AND symbol=? AND direction=? AND CAST(remaining_qty AS REAL) > 0
+            ORDER BY ts ASC, id ASC
+        """, (bot_id, symbol, direction))
 
-        # write exit record
-        cur.execute("""
-            INSERT INTO exits (
-                bot_id, symbol, direction, entry_side, exit_side,
-                exit_qty, entry_price, exit_price, realized_pnl, reason, ts
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            bot_id, symbol, direction, str(entry_side).upper(), exit_side,
-            str(take), str(entry_price), str(px_exit), str(pnl), reason, ts
-        ))
+        rows = cur.fetchall()
+        if not rows:
+            print(f"[PNL] WARNING: record_exit_fifo found NO open lots for {bot_id} {symbol}")
+            return {"remaining_need": str(need)}
 
-        need -= take
+        ts = _now()
+        remaining_need = need
 
-    conn.commit()
-    conn.close()
-    print(f"[PNL] record_exit_fifo DONE for {bot_id} {symbol}. Remaining need={need}")
+        for r in rows:
+            if remaining_need <= 0:
+                break
+
+            lot_id = r["id"]
+            rem = _d(r["remaining_qty"])
+            entry_price = _d(r["entry_price"])
+
+            if rem <= 0:
+                continue
+
+            take = rem if rem <= remaining_need else remaining_need
+
+            # realized pnl
+            if direction == "LONG":
+                pnl = (px_exit - entry_price) * take
+            else:
+                pnl = (entry_price - px_exit) * take
+
+            new_rem = rem - take
+
+            # update lot remaining
+            cur.execute("""
+                UPDATE lots SET remaining_qty=?
+                WHERE id=?
+            """, (str(new_rem), lot_id))
+
+            # write exit record
+            cur.execute("""
+                INSERT INTO exits (
+                    bot_id, symbol, direction, entry_side, exit_side,
+                    exit_qty, entry_price, exit_price, realized_pnl, reason, ts
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                bot_id, symbol, direction, str(entry_side).upper(), exit_side,
+                str(take), str(entry_price), str(px_exit), str(pnl), reason, ts
+            ))
+
+            remaining_need -= take
+
+        return {"remaining_need": str(remaining_need)}
+
+    out = _write_with_retry(_w)
+    print(f"[PNL] record_exit_fifo DONE for {bot_id} {symbol}. Remaining need={out.get('remaining_need')}")
 
 
 def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -228,7 +314,7 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
 
     out: Dict[Tuple[str, str], Dict[str, Any]] = {}
     rows = cur.fetchall()
-    
+
     for r in rows:
         symbol = r["symbol"]
         direction = r["direction"]
@@ -323,24 +409,27 @@ def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
 
 def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct: Decimal):
     lvl = _d(lock_level_pct)
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO lock_levels (bot_id, symbol, direction, lock_level_pct, updated_ts)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(bot_id, symbol, direction)
-        DO UPDATE SET lock_level_pct=excluded.lock_level_pct, updated_ts=excluded.updated_ts
-    """, (bot_id, symbol, direction.upper(), str(lvl), _now()))
-    conn.commit()
-    conn.close()
+
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO lock_levels (bot_id, symbol, direction, lock_level_pct, updated_ts)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(bot_id, symbol, direction)
+            DO UPDATE SET lock_level_pct=excluded.lock_level_pct, updated_ts=excluded.updated_ts
+        """, (bot_id, symbol, direction.upper(), str(lvl), _now()))
+        return True
+
+    _write_with_retry(_w)
 
 
 def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM lock_levels
-        WHERE bot_id=? AND symbol=? AND direction=?
-    """, (bot_id, symbol, direction.upper()))
-    conn.commit()
-    conn.close()
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM lock_levels
+            WHERE bot_id=? AND symbol=? AND direction=?
+        """, (bot_id, symbol, direction.upper()))
+        return True
+
+    _write_with_retry(_w)
