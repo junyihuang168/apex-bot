@@ -1,8 +1,8 @@
 import os
 import sqlite3
 import time
-from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Tuple, Any, List, Optional, Callable
+from decimal import Decimal
+from typing import Dict, Tuple, Any, List, Callable, Optional, Set
 
 # ✅ 修改：使用绝对路径，避免不同运行环境找不到文件
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,18 +28,14 @@ def _d(x) -> Decimal:
 
 
 def _connect():
-    # timeout + busy_timeout reduce "database is locked" under multi-thread writes
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=max(1, SQLITE_BUSY_TIMEOUT_MS // 1000))
     conn.row_factory = sqlite3.Row
-
-    # PRAGMAs for concurrency stability
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
     except Exception:
         pass
-
     return conn
 
 
@@ -68,6 +64,12 @@ def _write_with_retry(fn: Callable[[sqlite3.Connection], Any]) -> Any:
 
 
 def init_db():
+    """
+    ✅ 迁移策略：
+    - CREATE TABLE IF NOT EXISTS：补齐缺失表
+    - CREATE INDEX IF NOT EXISTS：补齐索引
+    - 不删除老表/不改老字段，确保“直接迁移覆盖”安全
+    """
     try:
         conn = _connect()
         cur = conn.cursor()
@@ -106,7 +108,7 @@ def init_db():
         )
         """)
 
-        # lock levels
+        # lock levels（保留旧逻辑兼容）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS lock_levels (
             bot_id TEXT NOT NULL,
@@ -118,7 +120,7 @@ def init_db():
         )
         """)
 
-        # ✅ NEW: processed signals for idempotency
+        # processed_signals：幂等去重（你已有）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_signals (
             bot_id TEXT NOT NULL,
@@ -129,13 +131,93 @@ def init_db():
         )
         """)
 
+        # ✅ NEW：交易所挂 TP/SL 的保护单记录（用于 WS fills 自动记账 + OCO）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS protective_orders (
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,              -- LONG / SHORT
+            sl_order_id TEXT,
+            tp_order_id TEXT,
+            sl_client_id TEXT,
+            tp_client_id TEXT,
+            sl_price TEXT,
+            tp_price TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (bot_id, symbol, direction)
+        )
+        """)
+
+
+        # -------------------------
+        # Schema upgrades (safe ALTER)
+        # -------------------------
+        def _ensure_column(table: str, col: str, coltype: str):
+            cur.execute(f"PRAGMA table_info({table})")
+            rows = cur.fetchall()
+            existing = set()
+            for r in rows:
+                try:
+                    existing.add(r["name"])
+                except Exception:
+                    existing.add(r[1])
+            if col not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+
+        # Lots + exits need order tracking for reconciliation
+        _ensure_column('lots', 'order_id', 'TEXT')
+        _ensure_column('lots', 'client_order_id', 'TEXT')
+        _ensure_column('lots', 'fill_source', 'TEXT')
+
+        _ensure_column('exits', 'order_id', 'TEXT')
+        _ensure_column('exits', 'client_order_id', 'TEXT')
+        _ensure_column('exits', 'fill_source', 'TEXT')
+
+
+        # Pending entries/exits: if fills are delayed, reconcile asynchronously
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_side TEXT NOT NULL,
+            qty TEXT NOT NULL,
+            order_id TEXT,
+            client_order_id TEXT,
+            reason TEXT,
+            ts INTEGER NOT NULL
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pe_ts ON pending_entries(ts)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_exits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_side TEXT NOT NULL,
+            exit_side TEXT NOT NULL,
+            exit_qty TEXT NOT NULL,
+            order_id TEXT,
+            client_order_id TEXT,
+            reason TEXT,
+            ts INTEGER NOT NULL
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_px_ts ON pending_exits(ts)")
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ps_bot_ts ON processed_signals(bot_id, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_po_sl ON protective_orders(sl_order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_po_tp ON protective_orders(tp_order_id)")
 
         conn.commit()
         conn.close()
-        print("[PNL] Database initialized successfully.")
+        print("[PNL] Database initialized/migrated successfully.")
     except Exception as e:
         print(f"[PNL] CRITICAL ERROR initializing database at {DB_PATH}: {e}")
 
@@ -180,6 +262,9 @@ def mark_signal_processed(bot_id: str, signal_id: str, kind: str = ""):
     _write_with_retry(_w)
 
 
+# ---------------------------
+# Core PnL
+# ---------------------------
 def record_entry(
     bot_id: str,
     symbol: str,
@@ -187,6 +272,8 @@ def record_entry(
     qty: Decimal,
     price: Decimal,
     reason: str = "strategy_entry",
+    order_id: str = "",
+    client_order_id: str = "",
 ):
     direction = _side_to_direction(side)
     q = _d(qty)
@@ -198,11 +285,11 @@ def record_entry(
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts, order_id, client_order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             bot_id, symbol, direction, str(side).upper(),
-            str(q), str(p), str(q), reason, _now()
+            str(q), str(p), str(q), reason, _now(), str(order_id or ''), str(client_order_id or '')
         ))
         return True
 
@@ -217,6 +304,8 @@ def record_exit_fifo(
     exit_qty: Decimal,
     exit_price: Decimal,
     reason: str = "strategy_exit",
+    order_id: str = "",
+    client_order_id: str = "",
 ):
     direction = _side_to_direction(entry_side)
     exit_side = "SELL" if direction == "LONG" else "BUY"
@@ -274,12 +363,12 @@ def record_exit_fifo(
             cur.execute("""
                 INSERT INTO exits (
                     bot_id, symbol, direction, entry_side, exit_side,
-                    exit_qty, entry_price, exit_price, realized_pnl, reason, ts
+                    exit_qty, entry_price, exit_price, realized_pnl, reason, ts, order_id, client_order_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bot_id, symbol, direction, str(entry_side).upper(), exit_side,
-                str(take), str(entry_price), str(px_exit), str(pnl), reason, ts
+                str(take), str(entry_price), str(px_exit), str(pnl), reason, ts, str(order_id or ''), str(client_order_id or '')
             ))
 
             remaining_need -= take
@@ -301,41 +390,68 @@ def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]
     }
     """
     conn = _connect()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, direction,
+                   SUM(CAST(remaining_qty AS REAL)) AS qty_sum,
+                   SUM(CAST(remaining_qty AS REAL) * CAST(entry_price AS REAL)) AS notional_sum
+            FROM lots
+            WHERE bot_id=? AND CAST(remaining_qty AS REAL) > 0
+            GROUP BY symbol, direction
+        """, (bot_id,))
 
-    cur.execute("""
-        SELECT symbol, direction,
-               SUM(CAST(remaining_qty AS REAL)) AS qty_sum,
-               SUM(CAST(remaining_qty AS REAL) * CAST(entry_price AS REAL)) AS notional_sum
-        FROM lots
-        WHERE bot_id=? AND CAST(remaining_qty AS REAL) > 0
-        GROUP BY symbol, direction
-    """, (bot_id,))
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        rows = cur.fetchall()
 
-    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    rows = cur.fetchall()
+        for r in rows:
+            symbol = r["symbol"]
+            direction = r["direction"]
+            qty_sum = _d(r["qty_sum"] or "0")
+            notional_sum = _d(r["notional_sum"] or "0")
 
-    for r in rows:
-        symbol = r["symbol"]
-        direction = r["direction"]
-        qty_sum = _d(r["qty_sum"] or "0")
-        notional_sum = _d(r["notional_sum"] or "0")
+            weighted = (notional_sum / qty_sum) if qty_sum > 0 else Decimal("0")
 
-        if qty_sum > 0:
-            weighted = (notional_sum / qty_sum)
-        else:
-            weighted = Decimal("0")
+            out[(symbol, direction)] = {
+                "qty": qty_sum,
+                "weighted_entry": weighted
+            }
 
-        out[(symbol, direction)] = {
-            "qty": qty_sum,
-            "weighted_entry": weighted
-        }
+        return out
+    finally:
+        conn.close()
 
-    conn.close()
-    return out
+
+def get_symbol_open_directions(symbol: str) -> Set[str]:
+    """Return a set of open directions {'LONG','SHORT'} for the given symbol across ALL bots."""
+    symbol = str(symbol).upper().strip()
+    if not symbol:
+        return set()
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT DISTINCT direction
+            FROM lots
+            WHERE symbol=? AND CAST(remaining_qty AS REAL) > 0
+            """,
+            (symbol,),
+        ).fetchall()
+
+        dirs: Set[str] = set()
+        for (direction,) in rows:
+            d = str(direction or "").upper().strip()
+            if d in ("LONG", "SHORT"):
+                dirs.add(d)
+        return dirs
+    finally:
+        conn.close()
 
 
 def list_bots_with_activity() -> List[str]:
+
     conn = _connect()
     cur = conn.cursor()
 
@@ -388,23 +504,22 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# Lock level persistence
+# Lock level persistence（保留兼容）
 # ---------------------------
-def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
+def get_lock_level_pct(bot_id: str, symbol: str, direction: str):
+    # Return Decimal lock level, or None if missing.
     conn = _connect()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT lock_level_pct FROM lock_levels
-        WHERE bot_id=? AND symbol=? AND direction=?
-    """, (bot_id, symbol, direction.upper()))
+    cur.execute("SELECT lock_level_pct FROM lock_levels WHERE bot_id=? AND symbol=? AND direction=?",
+                (bot_id, symbol, direction.upper()))
     row = cur.fetchone()
     conn.close()
     if not row:
-        return Decimal("0")
+        return None
     try:
-        return _d(row["lock_level_pct"])
+        return _d(row['lock_level_pct'])
     except Exception:
-        return Decimal("0")
+        return None
 
 
 def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct: Decimal):
@@ -430,6 +545,289 @@ def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
             DELETE FROM lock_levels
             WHERE bot_id=? AND symbol=? AND direction=?
         """, (bot_id, symbol, direction.upper()))
+        return True
+
+    _write_with_retry(_w)
+
+
+# ---------------------------
+# ✅ Protective Orders (TP/SL) persistence
+# ---------------------------
+def set_protective_orders(
+    bot_id: str,
+    symbol: str,
+    direction: str,
+    sl_order_id: Optional[str],
+    tp_order_id: Optional[str],
+    sl_client_id: Optional[str],
+    tp_client_id: Optional[str],
+    sl_price: Optional[Decimal],
+    tp_price: Optional[Decimal],
+    is_active: bool = True,
+):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO protective_orders (
+                bot_id, symbol, direction,
+                sl_order_id, tp_order_id, sl_client_id, tp_client_id,
+                sl_price, tp_price, is_active, updated_ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bot_id, symbol, direction)
+            DO UPDATE SET
+                sl_order_id=excluded.sl_order_id,
+                tp_order_id=excluded.tp_order_id,
+                sl_client_id=excluded.sl_client_id,
+                tp_client_id=excluded.tp_client_id,
+                sl_price=excluded.sl_price,
+                tp_price=excluded.tp_price,
+                is_active=excluded.is_active,
+                updated_ts=excluded.updated_ts
+        """, (
+            bot_id, symbol, direction.upper(),
+            str(sl_order_id) if sl_order_id else None,
+            str(tp_order_id) if tp_order_id else None,
+            str(sl_client_id) if sl_client_id else None,
+            str(tp_client_id) if tp_client_id else None,
+            str(_d(sl_price)) if sl_price is not None else None,
+            str(_d(tp_price)) if tp_price is not None else None,
+            1 if is_active else 0,
+            _now(),
+        ))
+        return True
+
+    _write_with_retry(_w)
+
+
+def get_protective_orders(bot_id: str, symbol: str, direction: str) -> Dict[str, Any]:
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM protective_orders
+            WHERE bot_id=? AND symbol=? AND direction=?
+            LIMIT 1
+        """, (bot_id, symbol, direction.upper()))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def clear_protective_orders(bot_id: str, symbol: str, direction: str):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM protective_orders
+            WHERE bot_id=? AND symbol=? AND direction=?
+        """, (bot_id, symbol, direction.upper()))
+        return True
+
+    _write_with_retry(_w)
+
+
+def find_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
+    """
+    给 WS fill 用：通过 orderId 找到属于哪个 bot/symbol/direction，以及是 SL 还是 TP
+    """
+    if not order_id:
+        return {}
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM protective_orders
+            WHERE (sl_order_id=? OR tp_order_id=?)
+              AND is_active=1
+            LIMIT 1
+        """, (str(order_id), str(order_id)))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        d = dict(row)
+        kind = "SL" if d.get("sl_order_id") == str(order_id) else "TP"
+        d["kind"] = kind
+        return d
+    finally:
+        conn.close()
+
+
+# Backward-compatible alias (older app.py expects this name)
+def get_protective_owner_by_order_id(order_id: str) -> Dict[str, Any]:
+    return find_protective_owner_by_order_id(order_id)
+
+
+def list_recent_trades(bot_id: Optional[str] = None, limit: int = 200) -> list:
+    """
+    Recent realized trades (from exits table), newest first.
+    Used by /dashboard and /api/trades.
+    """
+    try:
+        limit_i = int(limit)
+        if limit_i < 1:
+            limit_i = 200
+        limit_i = min(limit_i, 500)
+    except Exception:
+        limit_i = 200
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if bot_id:
+            cur.execute("""
+                SELECT ts, bot_id, symbol, direction, entry_side, exit_qty, entry_price, exit_price,
+                       realized_pnl, reason
+                FROM exits
+                WHERE bot_id=?
+                ORDER BY ts DESC
+                LIMIT ?
+            """, (str(bot_id), limit_i))
+        else:
+            cur.execute("""
+                SELECT ts, bot_id, symbol, direction, entry_side, exit_qty, entry_price, exit_price,
+                       realized_pnl, reason
+                FROM exits
+                ORDER BY ts DESC
+                LIMIT ?
+            """, (limit_i,))
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            out.append({
+                "ts": int(d.get("ts") or 0),
+                "bot_id": d.get("bot_id"),
+                "symbol": d.get("symbol"),
+                "direction": d.get("direction"),
+                "entry_side": d.get("entry_side"),
+                "exit_qty": str(d.get("exit_qty") or ""),
+                "entry_price": str(d.get("entry_price") or ""),
+                "exit_price": str(d.get("exit_price") or ""),
+                "realized_pnl": str(d.get("realized_pnl") or "0"),
+                "reason": d.get("reason") or "",
+            })
+        return out
+    finally:
+        conn.close()
+
+# ---------------------------
+# Pending entries/exits (fills reconciliation)
+# ---------------------------
+
+def add_pending_entry(
+    bot_id: str,
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+    reason: str = "pending_entry",
+):
+    direction = _side_to_direction(side)
+    q = _d(qty)
+    if q <= 0:
+        raise ValueError("pending entry requires qty>0")
+
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO pending_entries (bot_id, symbol, direction, entry_side, qty, order_id, client_order_id, reason, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                bot_id,
+                str(symbol).upper(),
+                direction,
+                str(side).upper(),
+                str(q),
+                str(order_id) if order_id else None,
+                str(client_order_id) if client_order_id else None,
+                reason,
+                _now(),
+            ),
+        )
+        return True
+
+    _write_with_retry(_w)
+
+
+def list_pending_entries(limit: int = 200):
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM pending_entries ORDER BY id ASC LIMIT ?",
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def delete_pending_entry(row_id: int):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pending_entries WHERE id=?", (int(row_id),))
+        return True
+
+    _write_with_retry(_w)
+
+
+def add_pending_exit(
+    bot_id: str,
+    symbol: str,
+    entry_side: str,
+    exit_qty: Decimal,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+    reason: str = "pending_exit",
+):
+    direction = _side_to_direction(entry_side)
+    exit_side = "SELL" if direction == "LONG" else "BUY"
+    q = _d(exit_qty)
+    if q <= 0:
+        raise ValueError("pending exit requires qty>0")
+
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO pending_exits (bot_id, symbol, direction, entry_side, exit_side, exit_qty, order_id, client_order_id, reason, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                bot_id,
+                str(symbol).upper(),
+                direction,
+                str(entry_side).upper(),
+                exit_side,
+                str(q),
+                str(order_id) if order_id else None,
+                str(client_order_id) if client_order_id else None,
+                reason,
+                _now(),
+            ),
+        )
+        return True
+
+    _write_with_retry(_w)
+
+
+def list_pending_exits(limit: int = 200):
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM pending_exits ORDER BY id ASC LIMIT ?",
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def delete_pending_exit(row_id: int):
+    def _w(conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pending_exits WHERE id=?", (int(row_id),))
         return True
 
     _write_with_retry(_w)
