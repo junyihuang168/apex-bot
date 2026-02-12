@@ -120,6 +120,25 @@ def init_db():
         )
         """)
 
+        # trade_events: Dashboard live feed (ENTRY / EXIT / STOP_UPDATE). Keep last N days in UI.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trade_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,          -- LONG / SHORT
+            event_type TEXT NOT NULL,         -- ENTRY / EXIT / STOP_UPDATE
+            qty TEXT,                         -- Decimal as text (optional)
+            entry_price TEXT,                 -- Decimal as text (optional)
+            exit_price TEXT,                  -- Decimal as text (optional)
+            stop_price TEXT,                  -- Decimal as text (optional)
+            lock_level_pct TEXT,              -- Decimal as text (optional)
+            realized_pnl TEXT,                -- Decimal as text (optional; for EXIT)
+            reason TEXT,
+            ts INTEGER NOT NULL
+        )
+        """)
+
         # processed_signals：幂等去重（你已有）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_signals (
@@ -149,71 +168,13 @@ def init_db():
         )
         """)
 
-
-        # -------------------------
-        # Schema upgrades (safe ALTER)
-        # -------------------------
-        def _ensure_column(table: str, col: str, coltype: str):
-            cur.execute(f"PRAGMA table_info({table})")
-            rows = cur.fetchall()
-            existing = set()
-            for r in rows:
-                try:
-                    existing.add(r["name"])
-                except Exception:
-                    existing.add(r[1])
-            if col not in existing:
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
-
-        # Lots + exits need order tracking for reconciliation
-        _ensure_column('lots', 'order_id', 'TEXT')
-        _ensure_column('lots', 'client_order_id', 'TEXT')
-        _ensure_column('lots', 'fill_source', 'TEXT')
-
-        _ensure_column('exits', 'order_id', 'TEXT')
-        _ensure_column('exits', 'client_order_id', 'TEXT')
-        _ensure_column('exits', 'fill_source', 'TEXT')
-
-
-        # Pending entries/exits: if fills are delayed, reconcile asynchronously
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            entry_side TEXT NOT NULL,
-            qty TEXT NOT NULL,
-            order_id TEXT,
-            client_order_id TEXT,
-            reason TEXT,
-            ts INTEGER NOT NULL
-        )
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pe_ts ON pending_entries(ts)")
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_exits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            entry_side TEXT NOT NULL,
-            exit_side TEXT NOT NULL,
-            exit_qty TEXT NOT NULL,
-            order_id TEXT,
-            client_order_id TEXT,
-            reason TEXT,
-            ts INTEGER NOT NULL
-        )
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_px_ts ON pending_exits(ts)")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bot_symbol ON lots(bot_id, symbol, direction, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_exits_bot_ts ON exits(bot_id, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ps_bot_ts ON processed_signals(bot_id, ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_po_sl ON protective_orders(sl_order_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_po_tp ON protective_orders(tp_order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_te_bot_ts ON trade_events(bot_id, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_te_symbol_ts ON trade_events(symbol, ts)")
 
         conn.commit()
         conn.close()
@@ -272,8 +233,6 @@ def record_entry(
     qty: Decimal,
     price: Decimal,
     reason: str = "strategy_entry",
-    order_id: str = "",
-    client_order_id: str = "",
 ):
     direction = _side_to_direction(side)
     q = _d(qty)
@@ -285,11 +244,11 @@ def record_entry(
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts, order_id, client_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO lots (bot_id, symbol, direction, entry_side, qty, entry_price, remaining_qty, reason, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             bot_id, symbol, direction, str(side).upper(),
-            str(q), str(p), str(q), reason, _now(), str(order_id or ''), str(client_order_id or '')
+            str(q), str(p), str(q), reason, _now()
         ))
         return True
 
@@ -304,8 +263,6 @@ def record_exit_fifo(
     exit_qty: Decimal,
     exit_price: Decimal,
     reason: str = "strategy_exit",
-    order_id: str = "",
-    client_order_id: str = "",
 ):
     direction = _side_to_direction(entry_side)
     exit_side = "SELL" if direction == "LONG" else "BUY"
@@ -331,6 +288,8 @@ def record_exit_fifo(
 
         ts = _now()
         remaining_need = need
+        realized_sum = Decimal("0")
+
 
         for r in rows:
             if remaining_need <= 0:
@@ -348,8 +307,10 @@ def record_exit_fifo(
             # realized pnl
             if direction == "LONG":
                 pnl = (px_exit - entry_price) * take
+
             else:
                 pnl = (entry_price - px_exit) * take
+
 
             new_rem = rem - take
 
@@ -363,20 +324,21 @@ def record_exit_fifo(
             cur.execute("""
                 INSERT INTO exits (
                     bot_id, symbol, direction, entry_side, exit_side,
-                    exit_qty, entry_price, exit_price, realized_pnl, reason, ts, order_id, client_order_id
+                    exit_qty, entry_price, exit_price, realized_pnl, reason, ts
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bot_id, symbol, direction, str(entry_side).upper(), exit_side,
-                str(take), str(entry_price), str(px_exit), str(pnl), reason, ts, str(order_id or ''), str(client_order_id or '')
+                str(take), str(entry_price), str(px_exit), str(pnl), reason, ts
             ))
 
             remaining_need -= take
 
-        return {"remaining_need": str(remaining_need)}
+        return {"remaining_need": str(remaining_need), "realized_sum": str(realized_sum)}
 
     out = _write_with_retry(_w)
-    print(f"[PNL] record_exit_fifo DONE for {bot_id} {symbol}. Remaining need={out.get('remaining_need')}")
+    print(f"[PNL] record_exit_fifo DONE for {bot_id} {symbol}. Remaining need={out.get('remaining_need')} realized_sum={out.get('realized_sum')}")
+    return out
 
 
 def get_bot_open_positions(bot_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -506,23 +468,30 @@ def get_bot_summary(bot_id: str) -> Dict[str, Any]:
 # ---------------------------
 # Lock level persistence（保留兼容）
 # ---------------------------
-def get_lock_level_pct(bot_id: str, symbol: str, direction: str):
-    # Return Decimal lock level, or None if missing.
+def get_lock_level_pct(bot_id: str, symbol: str, direction: str) -> Decimal:
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
     conn = _connect()
     cur = conn.cursor()
-    cur.execute("SELECT lock_level_pct FROM lock_levels WHERE bot_id=? AND symbol=? AND direction=?",
-                (bot_id, symbol, direction.upper()))
+    cur.execute("""
+        SELECT lock_level_pct FROM lock_levels
+        WHERE bot_id=? AND symbol=? AND direction=?
+    """, (bot_id, symbol, direction.upper()))
     row = cur.fetchone()
     conn.close()
     if not row:
-        return None
+        return Decimal("0")
     try:
-        return _d(row['lock_level_pct'])
+        return _d(row["lock_level_pct"])
     except Exception:
-        return None
+        return Decimal("0")
 
 
 def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct: Decimal):
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
     lvl = _d(lock_level_pct)
 
     def _w(conn: sqlite3.Connection):
@@ -539,6 +508,9 @@ def set_lock_level_pct(bot_id: str, symbol: str, direction: str, lock_level_pct:
 
 
 def clear_lock_level_pct(bot_id: str, symbol: str, direction: str):
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
         cur.execute("""
@@ -713,121 +685,484 @@ def list_recent_trades(bot_id: Optional[str] = None, limit: int = 200) -> list:
     finally:
         conn.close()
 
-# ---------------------------
-# Pending entries/exits (fills reconciliation)
-# ---------------------------
+# -----------------------------------------------------------------------------
+# Compatibility helpers (older app.py / worker imports)
+# -----------------------------------------------------------------------------
 
-def add_pending_entry(
+def upsert_protective_orders(*args, **kwargs):
+    """Backward-compatible shim.
+
+    Some older versions of the repo imported `upsert_protective_orders` from pnl_store.
+    In this codebase, exchange-native protective orders are handled in the client/risk loop.
+    This function is intentionally a no-op to keep older imports working.
+    """
+    return None
+
+
+def list_pending_orders(*args, **kwargs):
+    """Backward-compatible shim.
+
+    Pending-order reconciliation is optional. If you don't use a pending-orders table,
+    returning an empty list is safe.
+    """
+    return []
+
+
+def touch_pending_try(*args, **kwargs):
+    return None
+
+
+def mark_pending_done(*args, **kwargs):
+    return None
+
+
+def mark_pending_failed(*args, **kwargs):
+    return None
+
+# ----------------------------
+# Dashboard live feed helpers
+# ----------------------------
+
+def record_trade_event(
     bot_id: str,
     symbol: str,
-    side: str,
-    qty: Decimal,
-    order_id: str | None = None,
-    client_order_id: str | None = None,
-    reason: str = "pending_entry",
+    direction: str,
+    event_type: str,
+    *,
+    qty: Optional[Decimal] = None,
+    entry_price: Optional[Decimal] = None,
+    exit_price: Optional[Decimal] = None,
+    stop_price: Optional[Decimal] = None,
+    lock_level_pct: Optional[Decimal] = None,
+    realized_pnl: Optional[Decimal] = None,
+    reason: str = "",
+    ts: Optional[int] = None,
 ):
-    direction = _side_to_direction(side)
-    q = _d(qty)
-    if q <= 0:
-        raise ValueError("pending entry requires qty>0")
+    """Insert a compact event for the dashboard live feed."""
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
+    event_type = str(event_type).upper().strip()
+    if not ts:
+        ts = _now()
 
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO pending_entries (bot_id, symbol, direction, entry_side, qty, order_id, client_order_id, reason, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO trade_events (
+                bot_id, symbol, direction, event_type,
+                qty, entry_price, exit_price, stop_price, lock_level_pct,
+                realized_pnl, reason, ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 bot_id,
-                str(symbol).upper(),
+                symbol,
                 direction,
-                str(side).upper(),
-                str(q),
-                str(order_id) if order_id else None,
-                str(client_order_id) if client_order_id else None,
-                reason,
-                _now(),
+                event_type,
+                (str(qty) if qty is not None else None),
+                (str(entry_price) if entry_price is not None else None),
+                (str(exit_price) if exit_price is not None else None),
+                (str(stop_price) if stop_price is not None else None),
+                (str(lock_level_pct) if lock_level_pct is not None else None),
+                (str(realized_pnl) if realized_pnl is not None else None),
+                (reason or None),
+                int(ts),
             ),
         )
         return True
 
-    _write_with_retry(_w)
+    return _write_with_retry(_w)
 
 
-def list_pending_entries(limit: int = 200):
+def list_trade_events(
+    *,
+    bot_id: Optional[str] = None,
+    limit: int = 50,
+    days: int = 7,
+) -> List[Dict[str, Any]]:
+    """List recent dashboard events (newest first)."""
+    limit = max(1, min(int(limit or 50), 500))
+    days = max(1, min(int(days or 7), 90))
+    since_ts = _now() - days * 86400
+
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM pending_entries ORDER BY id ASC LIMIT ?",
-            (int(limit),),
-        )
-        return [dict(r) for r in cur.fetchall()]
+        if bot_id:
+            bot_id = str(bot_id).upper().strip()
+            cur.execute(
+                """
+                SELECT * FROM trade_events
+                WHERE bot_id=? AND ts>=?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (bot_id, since_ts, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT * FROM trade_events
+                WHERE ts>=?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (since_ts, limit),
+            )
+
+        rows = cur.fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
     finally:
         conn.close()
 
 
-def delete_pending_entry(row_id: int):
-    def _w(conn: sqlite3.Connection):
+def realized_pnl_by_window(
+    window_seconds: int,
+    *,
+    bot_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return realized pnl + trade count over a lookback window."""
+    window_seconds = max(60, int(window_seconds))
+    since_ts = _now() - window_seconds
+
+    conn = _connect()
+    try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM pending_entries WHERE id=?", (int(row_id),))
-        return True
+        if bot_id:
+            bot_id = str(bot_id).upper().strip()
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(CAST(realized_pnl AS REAL)), 0.0) AS realized
+                FROM exits
+                WHERE bot_id=? AND ts>=?
+                """,
+                (bot_id, since_ts),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(CAST(realized_pnl AS REAL)), 0.0) AS realized
+                FROM exits
+                WHERE ts>=?
+                """,
+                (since_ts,),
+            )
 
-    _write_with_retry(_w)
+        r = cur.fetchone()
+        return {
+            "since_ts": int(since_ts),
+            "window_seconds": int(window_seconds),
+            "bot_id": bot_id,
+            "trades": int(r["trades"] or 0),
+            "realized": float(r["realized"] or 0.0),
+        }
+    finally:
+        conn.close()
 
+# ----------------------------
+# Dashboard live feed helpers
+# ----------------------------
 
-def add_pending_exit(
+def record_trade_event(
     bot_id: str,
     symbol: str,
-    entry_side: str,
-    exit_qty: Decimal,
-    order_id: str | None = None,
-    client_order_id: str | None = None,
-    reason: str = "pending_exit",
+    direction: str,
+    event_type: str,
+    *,
+    qty: Optional[Decimal] = None,
+    entry_price: Optional[Decimal] = None,
+    exit_price: Optional[Decimal] = None,
+    stop_price: Optional[Decimal] = None,
+    lock_level_pct: Optional[Decimal] = None,
+    realized_pnl: Optional[Decimal] = None,
+    reason: str = "",
+    ts: Optional[int] = None,
 ):
-    direction = _side_to_direction(entry_side)
-    exit_side = "SELL" if direction == "LONG" else "BUY"
-    q = _d(exit_qty)
-    if q <= 0:
-        raise ValueError("pending exit requires qty>0")
+    """Write a lightweight event row for the web dashboard.
+
+    event_type: ENTRY / EXIT / STOP_UPDATE
+    All numeric fields are stored as TEXT for Decimal safety.
+    """
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
+    event_type = str(event_type).upper().strip()
+    if ts is None:
+        ts = _now()
 
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO pending_exits (bot_id, symbol, direction, entry_side, exit_side, exit_qty, order_id, client_order_id, reason, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO trade_events (
+                bot_id, symbol, direction, event_type,
+                qty, entry_price, exit_price, stop_price, lock_level_pct,
+                realized_pnl, reason, ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 bot_id,
-                str(symbol).upper(),
+                symbol,
                 direction,
-                str(entry_side).upper(),
-                exit_side,
-                str(q),
-                str(order_id) if order_id else None,
-                str(client_order_id) if client_order_id else None,
-                reason,
-                _now(),
+                event_type,
+                (str(qty) if qty is not None else None),
+                (str(entry_price) if entry_price is not None else None),
+                (str(exit_price) if exit_price is not None else None),
+                (str(stop_price) if stop_price is not None else None),
+                (str(lock_level_pct) if lock_level_pct is not None else None),
+                (str(realized_pnl) if realized_pnl is not None else None),
+                (reason or None),
+                int(ts),
             ),
         )
         return True
 
-    _write_with_retry(_w)
+    return _write_with_retry(_w)
 
 
-def list_pending_exits(limit: int = 200):
+def list_trade_events(
+    *,
+    bot_id: Optional[str] = None,
+    limit: int = 50,
+    days: int = 7,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit or 50), 500))
+    days = max(1, min(int(days or 7), 90))
+    since_ts = _now() - days * 86400
+
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM pending_exits ORDER BY id ASC LIMIT ?",
-            (int(limit),),
-        )
-        return [dict(r) for r in cur.fetchall()]
+        if bot_id:
+            bot_id = str(bot_id).upper().strip()
+            cur.execute(
+                """
+                SELECT * FROM trade_events
+                WHERE bot_id=? AND ts>=?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (bot_id, since_ts, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT * FROM trade_events
+                WHERE ts>=?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (since_ts, limit),
+            )
+
+        rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({k: r[k] for k in r.keys()})
+        return out
     finally:
         conn.close()
 
 
-def delete_pending_exit(row_id: int):
+def realized_pnl_by_window(
+    window_seconds: int,
+    *,
+    bot_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    window_seconds = max(60, int(window_seconds))
+    since_ts = _now() - window_seconds
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if bot_id:
+            bot_id = str(bot_id).upper().strip()
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(CAST(realized_pnl AS REAL)), 0.0) AS realized
+                FROM exits
+                WHERE bot_id=? AND ts>=?
+                """,
+                (bot_id, since_ts),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(CAST(realized_pnl AS REAL)), 0.0) AS realized
+                FROM exits
+                WHERE ts>=?
+                """,
+                (since_ts,),
+            )
+
+        r = cur.fetchone()
+        return {
+            "since_ts": int(since_ts),
+            "window_seconds": int(window_seconds),
+            "bot_id": bot_id,
+            "trades": int(r["trades"] or 0),
+            "realized": float(r["realized"] or 0.0),
+        }
+    finally:
+        conn.close()
+
+# ----------------------------
+# Dashboard live feed helpers
+# ----------------------------
+
+def record_trade_event(
+    bot_id: str,
+    symbol: str,
+    direction: str,
+    event_type: str,
+    *,
+    qty: Optional[Decimal] = None,
+    entry_price: Optional[Decimal] = None,
+    exit_price: Optional[Decimal] = None,
+    stop_price: Optional[Decimal] = None,
+    lock_level_pct: Optional[Decimal] = None,
+    realized_pnl: Optional[Decimal] = None,
+    reason: str = "",
+    ts: Optional[int] = None,
+) -> bool:
+    """Write a small event row for the dashboard live feed."""
+    bot_id = str(bot_id).upper().strip()
+    symbol = str(symbol).upper().strip()
+    direction = str(direction).upper().strip()
+    event_type = str(event_type).upper().strip()
+    if ts is None:
+        ts = _now()
+
     def _w(conn: sqlite3.Connection):
         cur = conn.cursor()
-        cur.execute("DELETE FROM pending_exits WHERE id=?", (int(row_id),))
+        cur.execute(
+            """
+            INSERT INTO trade_events (
+                bot_id, symbol, direction, event_type,
+                qty, entry_price, exit_price, stop_price, lock_level_pct,
+                realized_pnl, reason, ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                bot_id,
+                symbol,
+                direction,
+                event_type,
+                (str(qty) if qty is not None else None),
+                (str(entry_price) if entry_price is not None else None),
+                (str(exit_price) if exit_price is not None else None),
+                (str(stop_price) if stop_price is not None else None),
+                (str(lock_level_pct) if lock_level_pct is not None else None),
+                (str(realized_pnl) if realized_pnl is not None else None),
+                (reason or None),
+                int(ts),
+            ),
+        )
         return True
 
-    _write_with_retry(_w)
+    return bool(_write_with_retry(_w))
+
+
+def list_trade_events(
+    *,
+    bot_id: Optional[str] = None,
+    limit: int = 60,
+    days: int = 7,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit or 60), 500))
+    days = max(1, min(int(days or 7), 90))
+    since_ts = _now() - days * 86400
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if bot_id:
+            bot_id = str(bot_id).upper().strip()
+            cur.execute(
+                """
+                SELECT * FROM trade_events
+                WHERE bot_id=? AND ts>=?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (bot_id, since_ts, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT * FROM trade_events
+                WHERE ts>=?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (since_ts, limit),
+            )
+
+        rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({k: r[k] for k in r.keys()})
+        return out
+    finally:
+        conn.close()
+
+
+def realized_pnl_by_window(
+    window_seconds: int,
+    *,
+    bot_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Realized PnL and trade count over a rolling window."""
+    window_seconds = max(60, int(window_seconds))
+    since_ts = _now() - window_seconds
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if bot_id:
+            bot_id = str(bot_id).upper().strip()
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(CAST(realized_pnl AS REAL)), 0.0) AS realized
+                FROM exits
+                WHERE bot_id=? AND ts>=?
+                """,
+                (bot_id, since_ts),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(CAST(realized_pnl AS REAL)), 0.0) AS realized
+                FROM exits
+                WHERE ts>=?
+                """,
+                (since_ts,),
+            )
+
+        r = cur.fetchone()
+        return {
+            "since_ts": int(since_ts),
+            "window_seconds": int(window_seconds),
+            "bot_id": bot_id,
+            "trades": int((r["trades"] or 0) if r else 0),
+            "realized": float((r["realized"] or 0.0) if r else 0.0),
+        }
+    finally:
+        conn.close()
