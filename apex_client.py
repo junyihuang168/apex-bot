@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import random
 import inspect
 import re
@@ -7,9 +8,15 @@ import threading
 import queue
 from collections import OrderedDict
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional, Tuple, Union, Iterable
+from typing import Any, Dict, Optional, Tuple, Union, Iterable, Set, List
 
 import requests
+
+# Public WS client (top-of-book)
+try:
+    import websocket  # websocket-client
+except Exception:
+    websocket = None
 
 from apexomni.http_private_sign import HttpPrivateSign
 from apexomni.constants import (
@@ -41,6 +48,10 @@ DEFAULT_SYMBOL_RULES = {
 
 SYMBOL_RULES: Dict[str, Dict[str, Any]] = {}
 
+# Cache timestamp for dynamically fetched market rules
+_SYMBOL_RULES_TS: float = 0.0
+_SYMBOL_RULES_LOCK = threading.Lock()
+
 NumberLike = Union[str, int, float]
 
 _CLIENT: Optional[HttpPrivateSign] = None
@@ -68,6 +79,43 @@ _ORDER_STATE: Dict[str, Dict[str, Any]] = {}
 _FILL_Q: "queue.Queue[dict]" = queue.Queue(maxsize=20000)
 
 
+# -----------------------------------------------------------------------------
+# Public WS (L1 / top-of-book)
+#
+# Purpose:
+# - Provide best bid / best ask (BBO) for bot-side risk checks.
+# - Keep a long-lived connection with ping/pong, reconnect, and resubscribe.
+# - Subscribe to: orderBook25.H.{symbol}
+#
+# Notes:
+# - This does NOT replace any private/fill logic; it is an additional market-data feed.
+# - We intentionally keep only a small in-memory book (25 levels) per topic.
+# -----------------------------------------------------------------------------
+
+_PUB_WS_STARTED = False
+_PUB_WS_LOCK = threading.Lock()
+
+_PUB_WS_THREAD: Optional[threading.Thread] = None
+_PUB_WS_APP: Any = None
+
+_PUB_WS_CONNECTED = False
+_PUB_WS_CONN_TS = 0.0
+_PUB_WS_LAST_SUB_TS = 0.0
+_PUB_WS_ACTIVE_TOPICS: Set[str] = set()
+
+_PUB_WS_SEND_Q: "queue.Queue[dict]" = queue.Queue(maxsize=5000)
+_PUB_WS_DESIRED_TOPICS: Set[str] = set()
+_PUB_WS_TOPICS_LOCK = threading.Lock()
+
+_PUB_LAST_MSG_TS = 0.0
+_PUB_LAST_PONG_TS = 0.0
+
+_BOOKS_BY_TOPIC: Dict[str, Dict[str, Any]] = {}
+
+_L1_LOCK = threading.Lock()
+_L1_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 # REST poller
 _REST_POLL_STARTED = False
 _REST_POLL_LOCK = threading.Lock()
@@ -93,6 +141,30 @@ def _get_ws_endpoint() -> Optional[str]:
     if env_name in {"main", "mainnet", "prod", "production"}:
         use_mainnet = True
     return APEX_OMNI_WS_MAIN if use_mainnet else APEX_OMNI_WS_TEST
+
+
+def _get_public_ws_endpoint() -> str:
+    """Public market-data WS endpoint.
+
+    The ApeX Omni public quote WS is separate from the private WS endpoint used by the SDK.
+    We allow overriding via env for maximum compatibility.
+    """
+    override = str(os.getenv("APEX_PUBLIC_WS_URL", "")).strip()
+    if override:
+        return override
+
+    use_mainnet = _env_bool("APEX_USE_MAINNET", False)
+    env_name = str(os.getenv("APEX_ENV", "")).lower()
+    if env_name in {"main", "mainnet", "prod", "production"}:
+        use_mainnet = True
+
+    # Defaults based on ApeX Omni docs/examples.
+    # If these ever change, set APEX_PUBLIC_WS_URL explicitly.
+    return (
+        "wss://quote.omni.apex.exchange/realtime_public"
+        if use_mainnet
+        else "wss://quote-qa.omni.apex.exchange/realtime_public"
+    )
 
 
 def _get_api_credentials() -> Dict[str, str]:
@@ -154,7 +226,7 @@ def _safe_call(fn, **kwargs):
         except TypeError as e:
             msg = str(e)
             # Critical: if filtering caused missing required args, retry unfiltered.
-            if ("missing" in msg) and ("required positional argument" in msg):
+            if ("missing" in msg) and (("required positional argument" in msg) or ("required positional arguments" in msg)):
                 return _call_with_prune(fn, call_kwargs)
             raise
 
@@ -330,8 +402,301 @@ def get_client() -> HttpPrivateSign:
     # CRITICAL: ensure accountV3 cache is a dict (SDK internal usage)
     _ensure_account_v3_cache(client)
 
+    # Best-effort: fetch dynamic market rules (stepSize/minQty/tickSize)
+    try:
+        refresh_symbol_rules(force=False)
+    except Exception as e:
+        print(f'[apex_client][WARN] refresh_symbol_rules failed (continuing): {e}')
+
     _CLIENT = client
     return client
+
+
+# -----------------------------------------------------------------------------
+# Dynamic market rules fetch
+# -----------------------------------------------------------------------------
+
+def _to_decimal(v: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
+    if v is None or v == '':
+        return default
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return default
+
+
+def _decimals_from_step(step: Optional[Decimal]) -> Optional[int]:
+    if step is None:
+        return None
+    try:
+        # exponent is negative decimals
+        exp = step.as_tuple().exponent
+        if exp >= 0:
+            return 0
+        return int(-exp)
+    except Exception:
+        return None
+
+
+def _extract_list_payload(j: Any) -> List[Dict[str, Any]]:
+    """Best-effort: collect a flat list of dict items from any nested payload.
+
+    ApeX public endpoints are not perfectly stable; some responses nest contract
+    metadata several levels deep (e.g., /api/v3/symbols). We traverse the payload
+    up to a limited depth and let _parse_rule_item() decide which dicts are
+    relevant instruments/markets.
+    """
+    out: List[Dict[str, Any]] = []
+    if j is None:
+        return out
+
+    def _visit(obj: Any, depth: int) -> None:
+        if depth < 0 or obj is None:
+            return
+        if isinstance(obj, dict):
+            out.append(obj)
+            for v in obj.values():
+                _visit(v, depth - 1)
+            return
+        if isinstance(obj, list):
+            for v in obj:
+                _visit(v, depth - 1)
+            return
+
+    _visit(j, 5)
+    # Dedupe by object id (dicts are unhashable)
+    seen: set[int] = set()
+    uniq: List[Dict[str, Any]] = []
+    for it in out:
+        oid = id(it)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        if isinstance(it, dict):
+            uniq.append(it)
+    return uniq
+
+def _deep_find_first(obj: Any, keys: Iterable[str], max_depth: int = 4) -> Any:
+    """Recursively search nested dict/list structures for the first matching key.
+
+    ApeX public endpoints are not stable across environments/versions; some return
+    rules in nested 'filters'/'spec'/'config' objects. This helper makes symbol
+    rule parsing resilient so stepSize/minQty/tickSize are captured correctly.
+    """
+    if max_depth < 0:
+        return None
+    try:
+        if isinstance(obj, dict):
+            for k in keys:
+                if k in obj:
+                    v = obj.get(k)
+                    if v is not None and v != '':
+                        return v
+            for v in obj.values():
+                r = _deep_find_first(v, keys, max_depth=max_depth - 1)
+                if r is not None and r != '':
+                    return r
+        elif isinstance(obj, list):
+            for v in obj:
+                r = _deep_find_first(v, keys, max_depth=max_depth - 1)
+                if r is not None and r != '':
+                    return r
+    except Exception:
+        return None
+    return None
+
+
+
+def _parse_rule_item(item: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Parse a single instrument/market entry into our SYMBOL_RULES shape.
+
+    We intentionally support many key aliases because ApeX payloads differ across
+    environments/SDK versions.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    sym = (
+        item.get('symbol')
+        or item.get('crossSymbolName')
+        or item.get('crossSymbol')
+        or item.get('symbolName')
+        or item.get('contractName')
+        or item.get('instrument')
+        or item.get('instrumentId')
+        or item.get('market')
+        or item.get('name')
+        or item.get('contract')
+    )
+    if not sym:
+        return None
+
+    sym = format_symbol(str(sym))
+
+    # Quantity step/min
+    step_raw = (
+        item.get('stepSize') or item.get('step_size') or item.get('sizeStep') or item.get('qtyStep')
+        or item.get('quantityStep') or item.get('minSizeIncrement')
+    )
+    if step_raw is None or step_raw == '':
+        step_raw = _deep_find_first(item, ['stepSize', 'step_size', 'sizeStep', 'qtyStep', 'quantityStep', 'minSizeIncrement', 'step'])
+    step = _to_decimal(step_raw)
+
+    min_raw = (
+        item.get('minQty') or item.get('min_qty') or item.get('minSize') or item.get('minOrderSize')
+        or item.get('minQuantity')
+    )
+    if min_raw is None or min_raw == '':
+        min_raw = _deep_find_first(item, ['minQty', 'min_qty', 'minSize', 'minOrderSize', 'minQuantity', 'minOrderQty'])
+    min_qty = _to_decimal(min_raw)
+
+    # Price tick
+    tick_raw = (
+        item.get('tickSize') or item.get('tick_size') or item.get('priceStep') or item.get('minPriceIncrement')
+        or item.get('priceTick')
+    )
+    if tick_raw is None or tick_raw == '':
+        tick_raw = _deep_find_first(item, ['tickSize', 'tick_size', 'priceStep', 'minPriceIncrement', 'priceTick', 'tick'])
+    tick = _to_decimal(tick_raw)# Precision fallbacks
+    qty_dec = item.get('sizePrecision') or item.get('qtyPrecision') or item.get('quantityPrecision')
+    price_dec = item.get('pricePrecision') or item.get('quotePrecision')
+
+    try:
+        qty_dec = int(qty_dec) if qty_dec is not None and qty_dec != '' else None
+    except Exception:
+        qty_dec = None
+    try:
+        price_dec = int(price_dec) if price_dec is not None and price_dec != '' else None
+    except Exception:
+        price_dec = None
+
+    if step is None and qty_dec is not None:
+        try:
+            step = Decimal('1').scaleb(-qty_dec)
+        except Exception:
+            step = None
+    if tick is None and price_dec is not None:
+        try:
+            tick = Decimal('1').scaleb(-price_dec)
+        except Exception:
+            tick = None
+
+    # min qty fallback: if missing but step exists, use step
+    if min_qty is None and step is not None:
+        min_qty = step
+
+    if step is None and min_qty is None and tick is None:
+        return None
+
+    rule: Dict[str, Any] = {}
+    if min_qty is not None:
+        rule['min_qty'] = min_qty
+    if step is not None:
+        rule['step_size'] = step
+    if tick is not None:
+        rule['tick_size'] = tick
+
+    # Derive decimals from step/tick if not provided
+    if qty_dec is None and step is not None:
+        qty_dec = _decimals_from_step(step)
+    if price_dec is None and tick is not None:
+        price_dec = _decimals_from_step(tick)
+
+    if qty_dec is not None:
+        rule['qty_decimals'] = int(qty_dec)
+    if price_dec is not None:
+        rule['price_decimals'] = int(price_dec)
+
+    # Notional min (optional)
+    min_notional = _to_decimal(item.get('minNotional') or item.get('min_notional') or item.get('minValue') or item.get('minOrderValue'))
+    if min_notional is not None:
+        rule['min_notional'] = min_notional
+
+    return sym, rule
+
+
+def refresh_symbol_rules(force: bool = False) -> bool:
+    """Fetch market rules (stepSize/minQty/tickSize) and populate SYMBOL_RULES.
+
+    Why this matters:
+      - Different symbols have different size step/minimums (many are integer-only).
+      - If we compute qty without respecting stepSize, the exchange rejects the order,
+        and Trade History will be empty (exactly your LIT case).
+
+    Behavior:
+      - Best-effort and safe: never crashes startup; prints a warning on failure.
+      - Cached with a TTL.
+      - Can be disabled via env APEX_DISABLE_SYMBOL_RULES_FETCH=1
+    """
+    if _env_bool('APEX_DISABLE_SYMBOL_RULES_FETCH', False):
+        return False
+
+    ttl = float(os.getenv('SYMBOL_RULES_TTL_SEC', '3600'))
+    now = time.time()
+
+    global _SYMBOL_RULES_TS
+    with _SYMBOL_RULES_LOCK:
+        if (not force) and _SYMBOL_RULES_TS and (now - _SYMBOL_RULES_TS) < ttl and SYMBOL_RULES:
+            return True
+
+        base_url, _ = _get_base_and_network()
+        # ApeX environments/SDK builds differ in which public endpoints are exposed.
+        # We try a broader set; the first endpoint that yields parseable instruments
+        # will populate SYMBOL_RULES.
+        endpoints = [
+            # v3-style
+            '/api/v3/symbols',
+            '/api/v3/markets',
+            '/api/v3/instruments',
+            '/api/v3/contracts',
+            '/api/v3/exchangeInfo',
+            # older variants sometimes seen
+            '/api/v2/symbols',
+            '/api/v2/markets',
+            '/api/v1/symbols',
+            '/api/v1/markets',
+            '/api/v1/exchangeInfo',
+        ]
+
+        loaded = 0
+        tried = 0
+        last_err: Optional[Exception] = None
+
+        for ep in endpoints:
+            tried += 1
+            try:
+                url = f'{base_url}{ep}'
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                j = resp.json()
+                items = _extract_list_payload(j)
+                if not items:
+                    continue
+
+                for it in items:
+                    parsed = _parse_rule_item(it)
+                    if not parsed:
+                        continue
+                    sym, rule = parsed
+                    # Merge into dict (keep any pre-config overrides)
+                    cur = SYMBOL_RULES.get(sym, {})
+                    merged = dict(cur)
+                    merged.update(rule)
+                    SYMBOL_RULES[sym] = merged
+                    loaded += 1
+
+                if loaded > 0:
+                    _SYMBOL_RULES_TS = now
+                    print(f'[apex_client][rules] loaded {len(SYMBOL_RULES)} symbols from {ep}')
+                    return True
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        if last_err:
+            print(f'[apex_client][WARN] symbol rules fetch failed (tried={tried}): {last_err}')
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -368,6 +733,17 @@ def _snap_price(symbol: str, price: Decimal) -> Decimal:
         return Decimal("0")
     snapped = (price // tick) * tick
     return snapped.quantize(tick, rounding=ROUND_DOWN)
+
+
+def _dec_to_str(d: Decimal) -> str:
+    """Stable decimal->string without scientific notation."""
+    try:
+        s = format(d, 'f')
+    except Exception:
+        s = str(d)
+    if '.' in s:
+        s = s.rstrip('0').rstrip('.')
+    return s if s else '0'
 
 
 # -----------------------------------------------------------------------------
@@ -412,6 +788,27 @@ def get_reference_price(symbol: str) -> Decimal:
             last_err = e
 
     raise ValueError(f"ticker lookup failed for {sym_dash} (last_err={last_err})")
+
+
+def get_mark_price(symbol: str) -> Decimal:
+    """Return MARK price if available; otherwise fallback to INDEX then LAST.
+
+    We prefer MARK for risk controls because it is typically less noisy than last trade
+    and is used by many perpetual venues for liquidation/PNL calculations.
+    """
+    ticker = get_ticker(symbol)
+    # Common key names seen on different streams
+    for k in ('markPrice', 'mark_price', 'mark'):
+        if k in ticker and ticker[k] is not None:
+            return Decimal(str(ticker[k]))
+    for k in ('indexPrice', 'index_price', 'index'):
+        if k in ticker and ticker[k] is not None:
+            return Decimal(str(ticker[k]))
+    for k in ('lastPrice', 'last_price', 'last'):
+        if k in ticker and ticker[k] is not None:
+            return Decimal(str(ticker[k]))
+    # Last resort: reuse reference price logic (may raise if none found)
+    return get_reference_price(symbol)
 
 
 def get_market_price(symbol: str, side: str, size: str) -> str:
@@ -553,6 +950,18 @@ def _create_order_v3_compat(
         raise RuntimeError("_call_positional_with_prune failed")
 
     def _try_positional(f, payload: Dict[str, Any]):
+        """Call create_order_v3 with positional fallbacks.
+
+        ApeX SDK drifts here are especially painful. We've observed real deployments where
+        `create_order_v3()` is defined like either:
+          - create_order_v3(side, type, size, ...)
+          - create_order_v3(symbol, side, type, size, ...)
+          - create_order_v3(type, size, ... , symbol=?, side=? as kwargs)
+
+        This helper tries a broader positional matrix (while leaving any remaining fields
+        in kwargs) and prunes unexpected kwargs along the way.
+        """
+
         sym = payload.get("symbol", symbol)
         sd = payload.get("side", side)
         ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
@@ -562,26 +971,45 @@ def _create_order_v3_compat(
         if ty is None or sz is None:
             raise TypeError("positional fallback missing type/size")
 
-        kw = dict(payload)
-        for k in (
-            "symbol", "side", "type", "orderType", "order_type",
-            "size", "qty", "quantity",
-            "price", "limitPrice", "worstPrice", "worst_price",
-        ):
-            kw.pop(k, None)
+        SYM_KEYS = ("symbol",)
+        SIDE_KEYS = ("side",)
+        TYPE_KEYS = ("type", "orderType", "order_type")
+        SIZE_KEYS = ("size", "qty", "quantity")
+        PRICE_KEYS = ("price", "limitPrice", "worstPrice", "worst_price")
 
+        def _kw_without(*remove_keys: str) -> Dict[str, Any]:
+            kwp = dict(payload)
+            for k in remove_keys:
+                kwp.pop(k, None)
+            return kwp
+
+        # Patterns are (args, keys_to_remove_from_kwargs)
         patterns = []
-        patterns.append(([sd, ty, sz], kw))
-        patterns.append(([sym, sd, ty, sz], kw))
 
+        # Some builds require only (type, size) positionally.
+        patterns.append(([ty, sz], TYPE_KEYS + SIZE_KEYS))
         if px is not None:
-            patterns.append(([sd, ty, sz, px], kw))
-            patterns.append(([sym, sd, ty, sz, px], kw))
+            patterns.append(([ty, sz, px], TYPE_KEYS + SIZE_KEYS + PRICE_KEYS))
+
+        # Many builds use (side, type, size, ...)
+        patterns.append(([sd, ty, sz], SIDE_KEYS + TYPE_KEYS + SIZE_KEYS))
+        if px is not None:
+            patterns.append(([sd, ty, sz, px], SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS))
+
+        # Some builds include symbol explicitly.
+        patterns.append(([sym, sd, ty, sz], SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS))
+        if px is not None:
+            patterns.append(([sym, sd, ty, sz, px], SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS))
+
+        # A few builds use (symbol, type, size, ...)
+        patterns.append(([sym, ty, sz], SYM_KEYS + TYPE_KEYS + SIZE_KEYS))
+        if px is not None:
+            patterns.append(([sym, ty, sz, px], SYM_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS))
 
         last_e = None
-        for args, kwp in patterns:
+        for args, remove in patterns:
             try:
-                return _call_positional_with_prune(f, args, kwp)
+                return _call_positional_with_prune(f, args, _kw_without(*remove))
             except Exception as e:
                 last_e = e
                 continue
@@ -611,7 +1039,7 @@ def _create_order_v3_compat(
                             except TypeError as e:
                                 last_exc = e
                                 msg = str(e)
-                                if ("missing" in msg and "required positional argument" in msg) or (
+                                if ("missing" in msg and (("required positional argument" in msg) or ("required positional arguments" in msg))) or (
                                     "unexpected keyword argument" in msg and ("'type'" in msg or "'size'" in msg)
                                 ):
                                     try:
@@ -639,39 +1067,204 @@ def create_market_order(
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
-    qty = str(size)
 
+    # Snap qty to the symbol's stepSize/minQty (prevents exchange rejection)
+    qty_dec = _to_decimal(size, default=None)
+    if qty_dec is None:
+        raise ValueError(f"invalid size: {size}")
+    qty_snapped = _snap_quantity(sym, qty_dec)
+    qty = _dec_to_str(qty_snapped)
+
+    # ApeX requires a price field even for MARKET orders (signature). We use a conservative bound.
     worst_price = get_market_price(sym, side_u, qty)
 
     client_id = client_id or _random_client_id()
 
-    raw_res = _create_order_v3_compat(
-        client,
-        symbol=sym,
-        side=side_u,
-        order_type="MARKET",
-        size=qty,
-        price=str(worst_price),
-        reduce_only=bool(reduce_only),
-        client_id=str(client_id) if client_id else None,
-    )
+    def _place_market(size_str: str, cid: str) -> Dict[str, Any]:
+        return _create_order_v3_compat(
+            client,
+            symbol=sym,
+            side=side_u,
+            order_type="MARKET",
+            size=size_str,
+            price=str(worst_price),
+            reduce_only=bool(reduce_only),
+            client_id=str(cid) if cid else None,
+        )
+
+    try:
+        raw_res = _place_market(qty, client_id)
+    except Exception as e:
+        print(f"[apex_client][order][ERR] create MARKET failed symbol={sym} side={side_u} qty={qty} reduceOnly={reduce_only} clientId={client_id}: {e}")
+        raise
 
     # Robust parse
-    data = _extract_data_dict(raw_res)
+    data = _extract_data_dict(raw_res) or {}
     order_id = None
     client_order_id = None
 
+    # SDKs vary: sometimes orderId is nested, sometimes not present on error.
     if isinstance(data, dict):
         order_id = data.get("orderId") or data.get("id")
         client_order_id = data.get("clientOrderId") or data.get("clientId") or client_id
     else:
-        # object response
         try:
             order_id = getattr(raw_res, "orderId", None) or getattr(raw_res, "id", None)
         except Exception:
             order_id = None
         client_order_id = client_id
 
+    # Status / error extraction (for app.py to reject fast instead of timing out on fills)
+    status = ""
+    cancel_reason = ""
+    try:
+        if isinstance(data, dict):
+            status = str(data.get("status") or "").upper()
+            cancel_reason = str(
+                data.get("cancelReason")
+                or data.get("rejectReason")
+                or data.get("errorMessage")
+                or ""
+            )
+    except Exception:
+        status = ""
+        cancel_reason = ""
+
+    code = None
+    msg = ""
+    if isinstance(raw_res, dict):
+        code = raw_res.get("code") or raw_res.get("errCode") or raw_res.get("errorCode")
+        msg = str(raw_res.get("msg") or raw_res.get("message") or raw_res.get("error") or "")
+
+    # If no orderId, treat as rejected (most commonly: size step/precision violation)
+    if not order_id:
+        if not status:
+            status = "REJECTED"
+        if not cancel_reason and msg:
+            cancel_reason = msg
+
+        # Heuristic retry: many perp contracts are integer-sized (stepSize=1), but
+        # when symbol rules fetch fails we may still be using DEFAULT_SYMBOL_RULES (0.01).
+        # In that case, a qty like 5.61 will be rejected and Trade History will be empty.
+        reason_l = (cancel_reason or msg or "").lower()
+        rules = _get_symbol_rules(sym)
+        step_now = _to_decimal(rules.get('step_size'), default=Decimal('0.01')) or Decimal('0.01')
+        min_now = _to_decimal(rules.get('min_qty'), default=Decimal('0')) or Decimal('0')
+
+        # 🔧 Dynamic stepSize inference & retry:
+        # Some contracts require integer-lot sizing (e.g., stepSize=100). If our fetched rules are wrong
+        # (or partially parsed), the exchange rejects with a message like:
+        #   "Invalid size scale parameters. Value: 65905.09, stepSize is 100."
+        # In that case, parse the stepSize, update local rules, snap the qty, and retry once.
+        try:
+            m = re.search(r"stepsize\s*(?:is|=)\s*([0-9]+(?:\.[0-9]+)?)", (cancel_reason or msg or ""), re.IGNORECASE)
+            if m:
+                inferred_step = Decimal(m.group(1))
+                if inferred_step > 0 and inferred_step != step_now:
+                    snapped = (qty_dec // inferred_step) * inferred_step
+                    # quantize to integer-ish if step is whole number
+                    snapped = snapped.quantize(Decimal('1')) if inferred_step >= 1 else snapped.quantize(inferred_step, rounding=ROUND_DOWN)
+                    if snapped > 0:
+                        retry_cid = f"{client_id}RSTEP"
+                        retry_qty = _dec_to_str(snapped)
+                        try:
+                            raw_res2 = _place_market(retry_qty, retry_cid)
+                            data2 = _extract_data_dict(raw_res2) or {}
+                            oid2 = (data2.get('orderId') or data2.get('id')) if isinstance(data2, dict) else None
+                            if oid2:
+                                raw_res = raw_res2
+                                data = data2
+                                order_id = str(oid2)
+                                client_order_id = str(data2.get('clientOrderId') or data2.get('clientId') or retry_cid)
+                                qty_snapped = snapped
+                                qty = retry_qty
+                                status = str(data2.get('status') or status or '').upper() or status
+                                cancel_reason = str(
+                                    data2.get('cancelReason')
+                                    or data2.get('rejectReason')
+                                    or data2.get('errorMessage')
+                                    or cancel_reason
+                                    or ''
+                                )
+                                # Persist inferred rule for future orders
+                                try:
+                                    cur = SYMBOL_RULES.get(sym, {})
+                                    merged = dict(cur)
+                                    merged.update({
+                                        'step_size': inferred_step,
+                                        'min_qty': max(min_now, inferred_step) if min_now else inferred_step,
+                                        'qty_decimals': _decimals_from_step(inferred_step) or 0
+                                    })
+                                    SYMBOL_RULES[sym] = merged
+                                    print(f"[apex_client][rules][infer] {sym} overriding stepSize={inferred_step} (from rejection msg)")
+                                except Exception:
+                                    pass
+                        except Exception as e2:
+                            print(f"[apex_client][order][WARN] stepSize retry failed symbol={sym} step={inferred_step} qty={retry_qty} cid={retry_cid}: {e2}")
+        except Exception:
+            pass
+
+        # Only retry when qty is non-integer and our current step is sub-1 (likely default).
+        # Also require the reason to be plausibly sizing-related, or simply missing orderId.
+        sizing_hint = any(k in reason_l for k in (
+            'step', 'precision', 'invalid', 'size', 'quantity', 'lot', 'min', 'increment'
+        ))
+        try:
+            qty_int = qty_snapped.to_integral_value(rounding=ROUND_DOWN)
+        except Exception:
+            qty_int = None
+
+        # Retry only when our current rules are likely defaults (meaning fetch failed)
+        # and the rejection looks sizing-related.
+        try:
+            default_step = Decimal(str(DEFAULT_SYMBOL_RULES.get('step_size') or '0.01'))
+            default_min = Decimal(str(DEFAULT_SYMBOL_RULES.get('min_qty') or '0.01'))
+        except Exception:
+            default_step = Decimal('0.01')
+            default_min = Decimal('0.01')
+
+        likely_default_rules = (sym not in SYMBOL_RULES) or (step_now == default_step and (min_now == 0 or min_now == default_min))
+
+        if qty_int is not None and qty_int >= 1 and qty_snapped != qty_int and step_now < 1 and likely_default_rules and sizing_hint:
+            retry_cid = f"{client_id}R1"
+            retry_qty = _dec_to_str(qty_int)
+            try:
+                raw_res2 = _place_market(retry_qty, retry_cid)
+                data2 = _extract_data_dict(raw_res2) or {}
+                oid2 = (data2.get('orderId') or data2.get('id')) if isinstance(data2, dict) else None
+
+                # If retry produced an orderId, prefer it.
+                if oid2:
+                    raw_res = raw_res2
+                    data = data2
+                    order_id = str(oid2)
+                    client_order_id = str(data2.get('clientOrderId') or data2.get('clientId') or retry_cid)
+                    # Update qty fields to the retry quantity so downstream tracking/PNL uses the real requested size.
+                    qty_snapped = qty_int
+                    qty = retry_qty
+                    status = str(data2.get('status') or status or '').upper() or status
+                    cancel_reason = str(
+                        data2.get('cancelReason')
+                        or data2.get('rejectReason')
+                        or data2.get('errorMessage')
+                        or cancel_reason
+                        or ''
+                    )
+
+                    # Persist the inferred integer rule so future orders are snapped correctly.
+                    try:
+                        cur = SYMBOL_RULES.get(sym, {})
+                        merged = dict(cur)
+                        merged.update({'step_size': Decimal('1'), 'min_qty': Decimal('1'), 'qty_decimals': 0})
+                        SYMBOL_RULES[sym] = merged
+                        print(f"[apex_client][rules][infer] {sym} appears integer-sized; overriding stepSize=1 minQty=1")
+                    except Exception:
+                        pass
+            except Exception as e2:
+                # Keep original rejection info.
+                print(f"[apex_client][order][WARN] integer retry failed symbol={sym} qty={retry_qty} cid={retry_cid}: {e2}")
+
+    # Track only when we have a real order id
     if order_id:
         register_order_for_tracking(
             order_id=str(order_id),
@@ -680,8 +1273,26 @@ def create_market_order(
             expected_qty=qty,
         )
 
+    # Concise log for production diagnosis
+    brief_reason = (cancel_reason or msg or "")
+    if len(brief_reason) > 180:
+        brief_reason = brief_reason[:180] + "..."
+    print(
+        f"[apex_client][order] MARKET symbol={sym} side={side_u} qty={qty} reduceOnly={reduce_only} "
+        f"clientId={client_id} orderId={order_id or '-'} status={status or '-'} code={code or '-'} reason={brief_reason!r}"
+    )
+
     return {
         "raw": raw_res,
+        # Provide a 'data' dict so app.py can read status/cancelReason immediately
+        "data": {
+            "orderId": str(order_id) if order_id is not None else None,
+            "clientOrderId": str(client_order_id) if client_order_id is not None else str(client_id),
+            "status": status,
+            "cancelReason": cancel_reason,
+            "code": code,
+            "msg": msg,
+        },
         "order_id": str(order_id) if order_id is not None else None,
         "client_order_id": str(client_order_id) if client_order_id is not None else str(client_id),
         "symbol": sym,
@@ -706,6 +1317,22 @@ def create_trigger_order(
     client = get_client()
     sym = format_symbol(symbol)
     side_u = str(side).upper().strip()
+
+    # Snap qty and trigger price to exchange rules
+    try:
+        qd = _to_decimal(qty, default=Decimal('0'))
+        qd = _snap_quantity(sym, qd)
+        qty = format(qd, 'f')
+    except Exception as e:
+        print(f'[apex_client][order][ERROR] trigger qty invalid symbol={sym} qty={qty}: {e}')
+        raise
+
+    try:
+        tp = _to_decimal(trigger_price, default=None)
+        if tp is not None:
+            trigger_price = format(_snap_price(sym, tp), 'f')
+    except Exception:
+        pass
 
     try:
         protective_price = get_market_price(sym, side_u, qty)
@@ -769,7 +1396,81 @@ def create_trigger_order(
                                         register_order_for_tracking(str(oid), str(client_order_id or ""), sym)
                                 return res
                             except Exception as e:
+                                # Some SDK builds require positional args (notably: type + size). Try a broader
+                                # positional fallback before giving up.
                                 last_exc = e
+
+                                try:
+                                    if isinstance(e, TypeError) and ("missing" in str(e)) and ("required positional argument" in str(e)):
+                                        fn = getattr(client, "create_order_v3")
+
+                                        ty = payload.get("type") or payload.get("orderType") or payload.get("order_type")
+                                        sz = payload.get("size") or payload.get("qty") or payload.get("quantity")
+                                        px = payload.get("price") or payload.get("limitPrice") or payload.get("worstPrice") or payload.get("worst_price")
+
+                                        if ty is None or sz is None:
+                                            raise e
+
+                                        TYPE_KEYS = ("type", "orderType", "order_type")
+                                        SIZE_KEYS = ("size", "qty", "quantity")
+                                        PRICE_KEYS = ("price", "limitPrice", "worstPrice", "worst_price")
+                                        SIDE_KEYS = ("side",)
+                                        SYM_KEYS = ("symbol",)
+
+                                        def _call_positional_with_prune(f, args, kw_payload: Dict[str, Any]):
+                                            p = dict(kw_payload)
+                                            last = None
+                                            for _ in range(12):
+                                                try:
+                                                    return f(*args, **p)
+                                                except TypeError as te:
+                                                    last = te
+                                                    msg = str(te)
+                                                    m = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", msg)
+                                                    if m:
+                                                        bad = m.group(1)
+                                                        p.pop(bad, None)
+                                                        continue
+                                                    raise
+                                            if last:
+                                                raise last
+                                            raise RuntimeError("positional prune failed")
+
+                                        def _kw_without(remove_keys: Tuple[str, ...]):
+                                            kw = dict(payload)
+                                            for k in remove_keys:
+                                                kw.pop(k, None)
+                                            return kw
+
+                                        patterns = [
+                                            ([ty, sz], TYPE_KEYS + SIZE_KEYS),
+                                            ([ty, sz, px] if px is not None else None, TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                            ([side_u, ty, sz], SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
+                                            ([side_u, ty, sz, px] if px is not None else None, SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                            ([sym, side_u, ty, sz], SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS),
+                                            ([sym, side_u, ty, sz, px] if px is not None else None, SYM_KEYS + SIDE_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                            ([sym, ty, sz], SYM_KEYS + TYPE_KEYS + SIZE_KEYS),
+                                            ([sym, ty, sz, px] if px is not None else None, SYM_KEYS + TYPE_KEYS + SIZE_KEYS + PRICE_KEYS),
+                                        ]
+
+                                        for args, remove in patterns:
+                                            if args is None:
+                                                continue
+                                            try:
+                                                res2 = _call_positional_with_prune(fn, args, _kw_without(remove))
+                                                data2 = _extract_data_dict(res2)
+                                                if isinstance(data2, dict):
+                                                    oid2 = data2.get("orderId") or data2.get("id")
+                                                    if oid2:
+                                                        register_order_for_tracking(str(oid2), str(client_order_id or ""), sym)
+                                                return res2
+                                            except Exception as e2:
+                                                last_exc = e2
+                                                continue
+                                except Exception:
+                                    # Keep the original exception semantics.
+                                    pass
+
                                 continue
 
     if last_exc:
@@ -1216,6 +1917,109 @@ def _rest_fetch_fills_by_order(order_id: str, symbol: Optional[str] = None) -> O
     return None
 
 
+def _rest_fetch_fills_by_client_order_id(client_order_id: str, symbol: Optional[str] = None) -> Optional[list]:
+    # Best-effort REST fills/trades lookup by clientOrderId across SDK versions.
+    client = get_client()
+    cid = str(client_order_id)
+
+    method_names = [
+        'get_fills_v3',
+        'fills_v3',
+        'get_user_fills_v3',
+        'get_trades_v3',
+        'get_user_trades_v3',
+        'trade_history_v3',
+        'get_trade_history_v3',
+        'get_fill_history_v3',
+        'fill_history_v3',
+    ]
+
+    for name in method_names:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        # Try common parameter spellings
+        for kwargs in (
+            {'clientOrderId': cid, 'symbol': (symbol or None)},
+            {'client_order_id': cid, 'symbol': (symbol or None)},
+            {'clientId': cid, 'symbol': (symbol or None)},
+            {'client_id': cid, 'symbol': (symbol or None)},
+        ):
+            try:
+                res = _safe_call(fn, **kwargs)
+            except Exception:
+                continue
+
+            if res is None:
+                continue
+
+            data = res
+            if isinstance(res, dict):
+                data = res.get('data') if res.get('data') is not None else (res.get('list') or res.get('fills') or res.get('trades') or res)
+            if isinstance(data, dict) and 'list' in data:
+                data = data['list']
+            if isinstance(data, list):
+                return data
+
+    return None
+
+
+def _rest_fetch_recent_fills(symbol: Optional[str] = None, limit: int = 100) -> Optional[list]:
+    # REST recent fills/trades (no orderId filter). Used when the API does not support orderId query.
+    client = get_client()
+    lim = int(limit)
+    if lim <= 0:
+        lim = 100
+
+    method_names = [
+        'get_fills_v3',
+        'fills_v3',
+        'get_user_fills_v3',
+        'get_trades_v3',
+        'get_user_trades_v3',
+        'trade_history_v3',
+        'get_trade_history_v3',
+        'get_fill_history_v3',
+        'fill_history_v3',
+    ]
+
+    # Try a few common paging args
+    paging_variants = [
+        {'limit': lim},
+        {'pageSize': lim},
+        {'page_size': lim},
+        {'size': lim},
+        {},
+    ]
+
+    for name in method_names:
+        if not hasattr(client, name):
+            continue
+        fn = getattr(client, name)
+        for pv in paging_variants:
+            kwargs = dict(pv)
+            if symbol:
+                kwargs['symbol'] = symbol
+            try:
+                res = _safe_call(fn, **kwargs)
+            except Exception:
+                continue
+
+            if res is None:
+                continue
+
+            data = res
+            if isinstance(res, dict):
+                data = res.get('data') if res.get('data') is not None else (res.get('list') or res.get('fills') or res.get('trades') or res)
+            if isinstance(data, dict) and 'list' in data:
+                data = data['list']
+            if isinstance(data, list):
+                return data
+
+    return None
+
+
+
 def start_order_rest_poller(poll_interval: float = 5.0) -> None:
     """Background REST reconciliation to fill WS gaps (orders+fills)."""
     global _REST_POLL_STARTED
@@ -1384,6 +2188,43 @@ def get_fill_summary(
         time.sleep(max(0.05, poll_interval))
 
     if order_id:
+        # REST fallback #1: direct fills/trades by orderId
+        try:
+            fills = _rest_fetch_fills_by_order(str(order_id), symbol=symbol)
+            if isinstance(fills, list) and fills:
+                qty_sum = Decimal("0")
+                notional = Decimal("0")
+                fee_sum = Decimal("0")
+                fee_seen = False
+                for f in fills:
+                    parsed = _parse_fill(f) if isinstance(f, dict) else None
+                    if not parsed:
+                        continue
+                    q = Decimal(str(parsed.get("qty") or "0"))
+                    p = Decimal(str(parsed.get("price") or "0"))
+                    if q > 0 and p > 0:
+                        qty_sum += q
+                        notional += (q * p)
+                        if parsed.get("fee") is not None:
+                            try:
+                                fee_sum += Decimal(str(parsed.get("fee")))
+                                fee_seen = True
+                            except Exception:
+                                pass
+                if qty_sum > 0 and notional > 0:
+                    return {
+                        "symbol": format_symbol(symbol),
+                        "order_id": str(order_id),
+                        "client_order_id": client_order_id,
+                        "filled_qty": str(qty_sum),
+                        "avg_fill_price": str(notional / qty_sum),
+                        "fee": str(fee_sum) if fee_seen else None,
+                        "source": "rest_fills_by_order",
+                    }
+        except Exception:
+            pass
+
+        # REST fallback #2: order detail (avgPx/cumQty)
         od = _rest_fetch_order(str(order_id))
         if isinstance(od, dict):
             d = od.get("data") if isinstance(od.get("data"), dict) else od
@@ -1399,6 +2240,62 @@ def get_fill_summary(
                         "fee": None,
                         "source": "rest_order_last",
                     }
+
+    
+
+    # REST fallback #3: if orderId filter is unsupported or order_id is missing,
+    # scan recent fills and match by client_order_id.
+    if client_order_id:
+        try:
+            # First try API-level clientOrderId filter if supported
+            fills = _rest_fetch_fills_by_client_order_id(str(client_order_id), symbol=symbol)
+            if not fills:
+                fills = _rest_fetch_recent_fills(symbol=symbol, limit=int(os.getenv('REST_RECENT_FILLS_LIMIT', '120')))
+
+            if isinstance(fills, list) and fills:
+                want_cid = str(client_order_id)
+                matched = []
+                for f in fills:
+                    if not isinstance(f, dict):
+                        continue
+                    parsed = _parse_fill(f)
+                    if not parsed:
+                        continue
+                    if str(parsed.get('client_order_id') or '') != want_cid:
+                        continue
+                    matched.append(parsed)
+
+                if matched:
+                    qty_sum = Decimal('0')
+                    notional = Decimal('0')
+                    fee_sum = Decimal('0')
+                    fee_seen = False
+                    order_id_derived = matched[0].get('order_id')
+                    for parsed in matched:
+                        q = Decimal(str(parsed.get('qty') or '0'))
+                        p = Decimal(str(parsed.get('price') or '0'))
+                        if q > 0 and p > 0:
+                            qty_sum += q
+                            notional += (q * p)
+                        if parsed.get('fee') is not None:
+                            try:
+                                fee_sum += Decimal(str(parsed.get('fee')))
+                                fee_seen = True
+                            except Exception:
+                                pass
+
+                    if qty_sum > 0 and notional > 0:
+                        return {
+                            'symbol': format_symbol(symbol),
+                            'order_id': str(order_id_derived) if order_id_derived is not None else str(order_id or ''),
+                            'client_order_id': want_cid,
+                            'filled_qty': str(qty_sum),
+                            'avg_fill_price': str(notional / qty_sum),
+                            'fee': str(fee_sum) if fee_seen else None,
+                            'source': 'rest_recent_fills_scan',
+                        }
+        except Exception:
+            pass
 
     raise RuntimeError(f"fill_summary timeout; last_source={last_source}")
 
@@ -1421,3 +2318,427 @@ def format_symbol(symbol: str) -> str:
 def format_symbol_for_ticker(symbol: str) -> str:
     """Normalize to public ticker crossSymbolName (e.g., 'BTCUSDT')."""
     return re.sub(r"[^A-Z0-9]", "", format_symbol(symbol))
+
+
+# ──────────────────────────────────────────────────────────────
+# PUBLIC WS (L1) HELPERS
+# ──────────────────────────────────────────────────────────────
+
+_KNOWN_QUOTES: Tuple[str, ...] = ("USDT", "USDC", "USD", "BTC", "ETH")
+
+
+def _canon_symbol_from_ws_symbol(raw: str) -> str:
+    """Convert WS topic symbol into canonical 'BASE-QUOTE' if possible."""
+    s = str(raw or "").upper().replace("/", "-").replace("_", "-").strip()
+    if "-" in s:
+        return format_symbol(s)
+    for q in _KNOWN_QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return f"{s[:-len(q)]}-{q}"
+    return s
+
+
+def _topics_for_symbol(symbol: str, limit: int = 25, speed: str = "H") -> List[str]:
+    """Return one or more candidate topics for a symbol.
+
+    We subscribe to the canonical dash symbol and (optionally) the no-dash variant to
+    tolerate exchange/topic format drift.
+    """
+    lim = 25 if int(limit) != 200 else 200
+    spd = str(speed or "H").upper()
+    if spd not in {"H", "M"}:
+        spd = "H"
+
+    sym_dash = format_symbol(symbol)
+    sym_nodash = format_symbol_for_ticker(symbol)
+
+    topics = [f"orderBook{lim}.{spd}.{sym_dash}"]
+
+    # Default on: subscribe nodash too for compatibility.
+    if _env_bool("PUBLIC_WS_SUBSCRIBE_NODASH", True) and sym_nodash and sym_nodash != sym_dash:
+        topics.append(f"orderBook{lim}.{spd}.{sym_nodash}")
+    return topics
+
+
+def get_l1_bid_ask(symbol: str) -> Tuple[Optional[Decimal], Optional[Decimal], float]:
+    """Return (best_bid, best_ask, ts) from public WS cache."""
+    sym = format_symbol(symbol)
+    with _L1_LOCK:
+        row = _L1_CACHE.get(sym)
+        if not row:
+            return None, None, 0.0
+        return row.get("bid"), row.get("ask"), float(row.get("ts") or 0.0)
+
+
+def ensure_public_depth_subscription(symbol: str, limit: int = 25, speed: str = "H") -> None:
+    """Ensure the public WS is running and subscribed to orderBook topics for this symbol."""
+    start_public_ws()
+    topics = _topics_for_symbol(symbol, limit=limit, speed=speed)
+    new_topics: List[str] = []
+    with _PUB_WS_TOPICS_LOCK:
+        for t in topics:
+            if t not in _PUB_WS_DESIRED_TOPICS:
+                _PUB_WS_DESIRED_TOPICS.add(t)
+                new_topics.append(t)
+
+    # If WS is already connected, request subscribe immediately.
+    if new_topics and _env_bool("PUBLIC_WS_LOG_SUBS", False):
+        try:
+            print(f"[apex_client][PUBWS] want topics for {format_symbol(symbol)}: {new_topics}")
+        except Exception:
+            pass
+    for t in new_topics:
+        try:
+            _PUB_WS_SEND_Q.put_nowait({"op": "subscribe", "args": [t]})
+        except Exception:
+            pass
+
+
+def start_public_ws() -> None:
+    """Idempotent starter for the public market-data WS."""
+    global _PUB_WS_STARTED, _PUB_WS_THREAD
+    with _PUB_WS_LOCK:
+        if _PUB_WS_STARTED:
+            return
+        _PUB_WS_STARTED = True
+
+    if websocket is None:
+        print("[apex_client][PUBWS] websocket-client unavailable; public WS disabled")
+        return
+
+    url = _get_public_ws_endpoint()
+
+    # Tunables
+    # NOTE: Many quote WS implementations rely on websocket-level ping frames, not app-level JSON {"op":"ping"}.
+    # We therefore DISABLE app-level ping by default to avoid being disconnected for sending an unknown message.
+    # If you confirm the server expects JSON ping/pong, set PUBLIC_WS_PING_SEC > 0.
+    ping_interval = float(os.getenv("PUBLIC_WS_PING_SEC", "0"))
+    pong_timeout = float(os.getenv("PUBLIC_WS_PONG_TIMEOUT_SEC", "0"))
+    idle_reconnect = float(os.getenv("PUBLIC_WS_IDLE_RECONNECT_SEC", "120"))
+    resubscribe_sec = float(os.getenv("PUBLIC_WS_RESUBSCRIBE_SEC", "60"))
+    idle_close_without_topics = _env_bool("PUBLIC_WS_IDLE_CLOSE_WITHOUT_TOPICS", False)
+
+    def _parse_levels(val: Any) -> List[Tuple[Decimal, Decimal]]:
+        out: List[Tuple[Decimal, Decimal]] = []
+        if not val:
+            return out
+        if isinstance(val, dict):
+            # Some feeds use {price: size}
+            for pk, sv in val.items():
+                try:
+                    p = Decimal(str(pk))
+                    s = Decimal(str(sv))
+                    out.append((p, s))
+                except Exception:
+                    continue
+            return out
+        if isinstance(val, list):
+            for row in val:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                try:
+                    p = Decimal(str(row[0]))
+                    s = Decimal(str(row[1]))
+                    out.append((p, s))
+                except Exception:
+                    continue
+        return out
+
+    def _update_book(topic: str, payload: Dict[str, Any]) -> None:
+        # Extract symbol from topic: orderBook25.H.BTC-USDT
+        parts = str(topic).split(".")
+        ws_sym = parts[-1] if parts else ""
+        canon = _canon_symbol_from_ws_symbol(ws_sym)
+
+        book = _BOOKS_BY_TOPIC.get(topic)
+        if book is None:
+            book = {"bids": {}, "asks": {}, "u": None}
+            _BOOKS_BY_TOPIC[topic] = book
+
+        # Determine whether snapshot or delta
+        mtype = str(payload.get("type") or payload.get("action") or "").lower()
+        is_snapshot = mtype in {"snapshot", "partial", "init"} or payload.get("snapshot") is True
+
+        # Locate data container
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+        # Update id (optional)
+        u = data.get("u") if isinstance(data, dict) else None
+        if u is None and isinstance(payload.get("u"), (int, str)):
+            u = payload.get("u")
+        try:
+            u_int = int(u) if u is not None and str(u).strip() != "" else None
+        except Exception:
+            u_int = None
+
+        # Basic monotonic check: if u regresses, ignore this update.
+        prev_u = book.get("u")
+        if u_int is not None and isinstance(prev_u, int) and u_int <= prev_u:
+            return
+
+        bids_val = None
+        asks_val = None
+        if isinstance(data, dict):
+            # Common variants: bids/asks, b/a
+            bids_val = data.get("bids") if "bids" in data else data.get("b")
+            asks_val = data.get("asks") if "asks" in data else data.get("a")
+
+        bids = _parse_levels(bids_val)
+        asks = _parse_levels(asks_val)
+
+        # Snapshot replaces; delta applies
+        if is_snapshot:
+            book["bids"] = {}
+            book["asks"] = {}
+
+        # Apply updates
+        for p, s in bids:
+            if s <= 0:
+                book["bids"].pop(p, None)
+            else:
+                book["bids"][p] = s
+        for p, s in asks:
+            if s <= 0:
+                book["asks"].pop(p, None)
+            else:
+                book["asks"][p] = s
+
+        if u_int is not None:
+            book["u"] = u_int
+
+        # Compute BBO
+        try:
+            best_bid = max(book["bids"].keys()) if book["bids"] else None
+            best_ask = min(book["asks"].keys()) if book["asks"] else None
+        except Exception:
+            best_bid, best_ask = None, None
+
+        if best_bid is None or best_ask is None:
+            # Don't overwrite cache with empties.
+            return
+
+        now = time.time()
+
+        with _L1_LOCK:
+            _L1_CACHE[canon] = {
+                "bid": best_bid,
+                "ask": best_ask,
+                "ts": now,
+                "topic": topic,
+                "u": book.get("u"),
+            }
+
+    def _run_forever() -> None:
+        global _PUB_WS_APP, _PUB_LAST_MSG_TS, _PUB_LAST_PONG_TS
+        backoff = 1.0
+
+        def _on_open(wsapp):
+            global _PUB_WS_CONNECTED, _PUB_WS_CONN_TS, _PUB_WS_ACTIVE_TOPICS, _PUB_WS_LAST_SUB_TS
+            nonlocal backoff
+            print(f"[apex_client][PUBWS] connected: {url}")
+            _PUB_WS_CONNECTED = True
+            _PUB_WS_CONN_TS = time.time()
+            _PUB_WS_ACTIVE_TOPICS = set()
+            backoff = 1.0
+            # Subscribe desired topics
+            with _PUB_WS_TOPICS_LOCK:
+                topics = list(_PUB_WS_DESIRED_TOPICS)
+            if topics:
+                try:
+                    wsapp.send(json.dumps({"op": "subscribe", "args": topics}))
+                    _PUB_WS_ACTIVE_TOPICS.update(set(topics))
+                    _PUB_WS_LAST_SUB_TS = time.time()
+                    print(f"[apex_client][PUBWS] subscribed {len(topics)} topics")
+                except Exception as e:
+                    print("[apex_client][PUBWS] subscribe on_open failed:", e)
+
+        def _on_message(wsapp, message: str):
+            """Handle messages from the public quote WS.
+
+            Important: update global timestamps so idle/pong logic works.
+            The exchange may also send application-level pings that must be
+            replied to, otherwise the server will close the socket.
+            """
+            global _PUB_LAST_MSG_TS, _PUB_LAST_PONG_TS
+            nonlocal backoff
+            try:
+                now_ts = time.time()
+                _PUB_LAST_MSG_TS = now_ts
+
+                # websocket-client may pass bytes
+                if isinstance(message, (bytes, bytearray)):
+                    try:
+                        message = message.decode("utf-8", errors="ignore")
+                    except Exception:
+                        return
+
+                # Some exchanges send plain "ping" / "pong" strings
+                if isinstance(message, str):
+                    m = message.strip().lower()
+                    if m == "pong":
+                        _PUB_LAST_PONG_TS = now_ts
+                        return
+                    if m == "ping":
+                        try:
+                            wsapp.send("pong")
+                        except Exception:
+                            pass
+                        _PUB_LAST_PONG_TS = now_ts
+                        return
+
+                msg = json.loads(message) if isinstance(message, str) else message
+                if not isinstance(msg, dict):
+                    return
+
+                # Application-level ping/pong (multiple protocol variants)
+                op = str(msg.get("op") or msg.get("event") or "").lower()
+                if op in {"pong", "pongs"}:
+                    _PUB_LAST_PONG_TS = now_ts
+                    return
+
+                if op == "ping":
+                    # Reply in the most common formats.
+                    try:
+                        wsapp.send(json.dumps({"op": "pong"}))
+                    except Exception:
+                        pass
+                    try:
+                        # Some servers expect echo timestamp/id
+                        if "ts" in msg:
+                            wsapp.send(json.dumps({"pong": msg.get("ts")}))
+                    except Exception:
+                        pass
+                    _PUB_LAST_PONG_TS = now_ts
+                    return
+
+                if "ping" in msg and isinstance(msg.get("ping"), (int, float, str)):
+                    try:
+                        wsapp.send(json.dumps({"pong": msg.get("ping")}))
+                    except Exception:
+                        pass
+                    _PUB_LAST_PONG_TS = now_ts
+                    return
+
+                # Error / info events (do not silently ignore)
+                ev = str(msg.get("event") or msg.get("type") or "").lower()
+                if ev == "error" or msg.get("code"):
+                    try:
+                        print(f"[apex_client][PUBWS] server msg: {msg}")
+                    except Exception:
+                        pass
+
+                topic = msg.get("topic") or msg.get("stream") or msg.get("channel")
+                if topic:
+                    _update_book(str(topic), msg)
+            except Exception:
+                # ignore parse errors (do not kill connection)
+                return
+
+        def _on_error(wsapp, error):
+            print("[apex_client][PUBWS] error:", error)
+
+        def _on_close(wsapp, status_code, msg):
+            global _PUB_WS_CONNECTED
+            _PUB_WS_CONNECTED = False
+            print(f"[apex_client][PUBWS] closed: code={status_code} msg={msg}")
+
+        while True:
+            try:
+                _PUB_LAST_MSG_TS = time.time()
+                _PUB_LAST_PONG_TS = time.time()
+                _PUB_WS_APP = websocket.WebSocketApp(
+                    url,
+                    on_open=_on_open,
+                    on_message=_on_message,
+                    on_error=_on_error,
+                    on_close=_on_close,
+                )
+
+                # Sender + heartbeat loop
+                def _heartbeat_and_sender():
+                    while True:
+                        # Flush outbound subscribe commands
+                        try:
+                            cmd = _PUB_WS_SEND_Q.get(timeout=0.5)
+                            if cmd and isinstance(cmd, dict):
+                                try:
+                                    _PUB_WS_APP.send(json.dumps(cmd))
+                                except Exception:
+                                    return
+                        except Exception:
+                            pass
+
+                        now = time.time()
+
+                        # Periodic re-subscribe (keeps topics alive across transient WS issues)
+                        if resubscribe_sec > 0:
+                            try:
+                                with _PUB_WS_TOPICS_LOCK:
+                                    topics_now = list(_PUB_WS_DESIRED_TOPICS)
+                                if topics_now and (time.time() - _PUB_WS_LAST_SUB_TS) >= resubscribe_sec:
+                                    try:
+                                        _PUB_WS_APP.send(json.dumps({"op": "subscribe", "args": topics_now}))
+                                        _PUB_WS_ACTIVE_TOPICS.update(set(topics_now))
+                                        _PUB_WS_LAST_SUB_TS = time.time()
+                                    except Exception:
+                                        return
+                            except Exception:
+                                pass
+
+
+                        # App-level ping (optional)
+                        if ping_interval > 0 and now - _PUB_LAST_PONG_TS >= ping_interval:
+                            try:
+                                _PUB_WS_APP.send(json.dumps({"op": "ping"}))
+                            except Exception:
+                                return
+
+                        # App-level pong timeout (only meaningful if we are sending/expecting app-level pong)
+                        if ping_interval > 0 and pong_timeout > 0 and now - _PUB_LAST_PONG_TS > (ping_interval + pong_timeout):
+                            try:
+                                _PUB_WS_APP.close()
+                            except Exception:
+                                pass
+                            return
+
+                        # Idle reconnect (socket might be "open" but not receiving)
+                        with _PUB_WS_TOPICS_LOCK:
+                            has_topics = bool(_PUB_WS_DESIRED_TOPICS)
+                        if idle_close_without_topics and (not has_topics) and idle_reconnect > 0 and now - _PUB_LAST_MSG_TS > idle_reconnect:
+                            try:
+                                _PUB_WS_APP.close()
+                            except Exception:
+                                pass
+                            return
+                        if idle_reconnect > 0 and has_topics and now - _PUB_LAST_MSG_TS > idle_reconnect:
+                            try:
+                                _PUB_WS_APP.close()
+                            except Exception:
+                                pass
+                            return
+
+                threading.Thread(target=_heartbeat_and_sender, daemon=True, name="apex-public-ws-heartbeat").start()
+
+                # Also enable websocket-level ping frames (in addition to app-level ping/pong above).
+                # This improves compatibility across different quote WS implementations.
+                ws_ping_interval = float(os.getenv("PUBLIC_WS_WS_PING_INTERVAL", "20"))
+                ws_ping_timeout = float(os.getenv("PUBLIC_WS_WS_PING_TIMEOUT", "10"))
+                _PUB_WS_APP.run_forever(
+                    ping_interval=ws_ping_interval if ws_ping_interval > 0 else 0,
+                    ping_timeout=ws_ping_timeout if ws_ping_timeout > 0 else None,
+                    ping_payload="ping",
+                )
+
+            except Exception as e:
+                print(f"[apex_client][PUBWS] reconnect: {e} (sleep {backoff}s)")
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+                continue
+
+            # run_forever returned -> reconnect
+            print(f"[apex_client][PUBWS] reconnecting (sleep {backoff}s)")
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+    _PUB_WS_THREAD = threading.Thread(target=_run_forever, daemon=True, name="apex-public-ws")
+    _PUB_WS_THREAD.start()
